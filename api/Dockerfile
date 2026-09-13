@@ -9,6 +9,7 @@ RUN CGO_ENABLED=0 go build -trimpath -o /bin/server ./cmd/server
 # ---- run ----
 FROM alpine:3.21
 RUN adduser -D -u 10001 app && mkdir -p /data && chown app:app /data
+COPY --from=build /bin/server /bin/server
 USER app
 ENV PORT=8080 \
     DB_PATH=/data/app.db \
