@@ -15,6 +15,13 @@
 // the out-of-cabinet state and re-evaluates usability. Revocation never
 // deletes rows: the event keeps revoked_at / revoke_reason for the audit
 // trail.
+//
+// Cabinet locations are tracked independently of the exposure state machine:
+// an in-cabinet usable batch may occupy at most one location and a location
+// may hold at most one batch. A successful takeout releases the occupancy in
+// the very same event transaction (a batch outside the cabinet occupies no
+// slot); a return leaves the batch unlocated until it is placed again, and
+// revoking a return likewise vacates its slot.
 package store
 
 import (
@@ -71,6 +78,10 @@ type Batch struct {
 	LastEventType      *string    // nil when no event has happened yet
 	LastEventAt        *time.Time // nil when no event has happened yet
 	LastTakeoutAt      *time.Time // open takeout time, set while State == StateOut
+	// Location is the cabinet slot currently occupied by the batch; nil while
+	// the batch is unplaced (outside the cabinet, freshly returned, or not yet
+	// shelved).
+	Location *string
 }
 
 // Event is one accepted takeout/return record. A revoked event stays in the
@@ -157,6 +168,15 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			revoke_reason TEXT
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_barcode ON events (barcode, id)`,
+		// location_occupancy is the independent shelving ledger: at most one
+		// active row per batch (PRIMARY KEY) and per location (UNIQUE). A batch
+		// outside the cabinet, a freshly returned batch and a not-yet-shelved
+		// batch simply have no row; a takeout deletes its row inside the same
+		// event transaction.
+		`CREATE TABLE IF NOT EXISTS location_occupancy (
+			barcode  TEXT PRIMARY KEY REFERENCES batches (barcode),
+			location TEXT NOT NULL UNIQUE
+		)`,
 	}
 	for _, q := range stmts {
 		if _, err := db.ExecContext(ctx, q); err != nil {
@@ -194,22 +214,28 @@ func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
-const batchCols = `barcode, allowed_seconds, state, status, accumulated_seconds,
-	created_at, last_at, last_event_type, last_event_at, last_takeout_at`
+const batchCols = `b.barcode, b.allowed_seconds, b.state, b.status, b.accumulated_seconds,
+	b.created_at, b.last_at, b.last_event_type, b.last_event_at, b.last_takeout_at, o.location`
+
+// batchSelect loads the batch aggregate together with its current slot from
+// the independent location_occupancy ledger (NULL when the batch is unplaced).
+const batchSelect = `SELECT ` + batchCols + `
+	FROM batches b
+	LEFT JOIN location_occupancy o ON o.barcode = b.barcode
+	WHERE b.barcode = ?`
 
 // GetBatch loads a batch by barcode, or ErrNotFound.
 func (s *Store) GetBatch(ctx context.Context, barcode string) (*Batch, error) {
-	return scanBatch(s.db.QueryRowContext(ctx,
-		`SELECT `+batchCols+` FROM batches WHERE barcode = ?`, barcode))
+	return scanBatch(s.db.QueryRowContext(ctx, batchSelect, barcode))
 }
 
 func scanBatch(row *sql.Row) (*Batch, error) {
 	var b Batch
 	var createdAt, lastAt string
-	var lastEventType, lastEventAt, lastTakeoutAt sql.NullString
+	var lastEventType, lastEventAt, lastTakeoutAt, location sql.NullString
 	err := row.Scan(&b.Barcode, &b.AllowedSeconds, &b.State, &b.Status,
 		&b.AccumulatedSeconds, &createdAt, &lastAt,
-		&lastEventType, &lastEventAt, &lastTakeoutAt)
+		&lastEventType, &lastEventAt, &lastTakeoutAt, &location)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -239,6 +265,10 @@ func scanBatch(row *sql.Row) (*Batch, error) {
 			return nil, err
 		}
 		b.LastTakeoutAt = &t
+	}
+	if location.Valid {
+		v := location.String
+		b.Location = &v
 	}
 	return &b, nil
 }
@@ -380,8 +410,7 @@ func (s *Store) ApplyEvent(ctx context.Context, barcode, eventType string, at ti
 	}
 	defer tx.Rollback()
 
-	b, err := scanBatch(tx.QueryRowContext(ctx,
-		`SELECT `+batchCols+` FROM batches WHERE barcode = ?`, barcode))
+	b, err := scanBatch(tx.QueryRowContext(ctx, batchSelect, barcode))
 	if err != nil {
 		return nil, err
 	}
@@ -412,6 +441,12 @@ func (s *Store) ApplyEvent(ctx context.Context, barcode, eventType string, at ti
 		if n, err := res.RowsAffected(); err != nil || n != 1 {
 			return nil, conflict("invalid_transition", "batch state changed concurrently; retry")
 		}
+		// Leaving the cabinet vacates the slot in the very same transaction so
+		// a takeout can never leave a dangling occupancy behind.
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM location_occupancy WHERE barcode = ?`, barcode); err != nil {
+			return nil, err
+		}
 
 	case EventReturn:
 		if b.State != StateOut || b.LastTakeoutAt == nil {
@@ -435,6 +470,13 @@ func (s *Store) ApplyEvent(ctx context.Context, barcode, eventType string, at ti
 		}
 		if n, err := res.RowsAffected(); err != nil || n != 1 {
 			return nil, conflict("invalid_transition", "batch state changed concurrently; retry")
+		}
+		// A returned batch always comes back unplaced: the operator scans its
+		// new slot afterwards. The row is normally already gone (the takeout
+		// deleted it), but the DELETE restates that inside this transaction.
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM location_occupancy WHERE barcode = ?`, barcode); err != nil {
+			return nil, err
 		}
 
 	default:
@@ -480,8 +522,7 @@ func (s *Store) RevokeEvent(ctx context.Context, barcode string, eventID int64, 
 	}
 	defer tx.Rollback()
 
-	b, err := scanBatch(tx.QueryRowContext(ctx,
-		`SELECT `+batchCols+` FROM batches WHERE barcode = ?`, barcode))
+	b, err := scanBatch(tx.QueryRowContext(ctx, batchSelect, barcode))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -595,6 +636,14 @@ func (s *Store) RevokeEvent(ctx context.Context, barcode string, eventID int64, 
 	}
 	if n, err := res.RowsAffected(); err != nil || n != 1 {
 		return nil, nil, conflict("invalid_transition", "batch state changed concurrently; retry")
+	}
+	// Undoing the latest event rewinds the aggregate: a takeout undo lands
+	// back in the cabinet and a return undo reopens the out-of-cabinet state.
+	// In neither case is a previously recorded slot still authoritative, so the
+	// independent occupancy row is dropped in the same transaction.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM location_occupancy WHERE barcode = ?`, barcode); err != nil {
+		return nil, nil, err
 	}
 
 	revoked, err := scanEventRow(tx.QueryRowContext(ctx,

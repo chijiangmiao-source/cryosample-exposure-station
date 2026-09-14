@@ -32,13 +32,15 @@ func NewRouter(st *store.Store) *gin.Engine {
 	api.GET("/batches/:barcode/events", s.listEvents)
 	api.POST("/batches/:barcode/events", s.createEvent)
 	api.POST("/batches/:barcode/events/:id/revoke", s.revokeEvent)
+	api.PUT("/batches/:barcode/location", s.putLocation)
+	api.DELETE("/batches/:barcode/location", s.deleteLocation)
 	return r
 }
 
 func cors() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Content-Type")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
@@ -253,6 +255,70 @@ func (s *Server) revokeEvent(c *gin.Context) {
 	s.respondBatch(c, http.StatusOK, b, nil)
 }
 
+// --- cabinet locations -------------------------------------------------------
+
+type putLocationReq struct {
+	Location string `json:"location"`
+}
+
+// putLocation scans a location code and places (or moves) an in-cabinet usable
+// batch into that slot in one atomic transaction. See store.PutLocation for
+// the conflict rules; a rejected request never changes the previous
+// occupancy, the event log or the accumulated total.
+func (s *Server) putLocation(c *gin.Context) {
+	barcode := c.Param("barcode")
+	var req putLocationReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeErr(c, http.StatusBadRequest, "bad_request", "invalid JSON body: "+err.Error())
+		return
+	}
+	req.Location = strings.TrimSpace(req.Location)
+	if req.Location == "" {
+		writeErr(c, http.StatusBadRequest, "location_required", "location must be a non-empty string")
+		return
+	}
+	if len(req.Location) > 64 {
+		writeErr(c, http.StatusBadRequest, "location_too_long", "location must be at most 64 characters")
+		return
+	}
+	b, err := s.st.PutLocation(c.Request.Context(), barcode, req.Location)
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(c, http.StatusNotFound, "not_found", "no batch with this barcode")
+		return
+	}
+	var ce *store.ConflictError
+	if errors.As(err, &ce) {
+		writeErr(c, http.StatusConflict, ce.Code, ce.Message)
+		return
+	}
+	if err != nil {
+		writeErr(c, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	s.respondBatch(c, http.StatusOK, b, nil)
+}
+
+// deleteLocation vacates the batch's current slot without changing any event
+// or exposure total.
+func (s *Server) deleteLocation(c *gin.Context) {
+	barcode := c.Param("barcode")
+	b, err := s.st.ReleaseLocation(c.Request.Context(), barcode)
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(c, http.StatusNotFound, "not_found", "no batch with this barcode")
+		return
+	}
+	var ce *store.ConflictError
+	if errors.As(err, &ce) {
+		writeErr(c, http.StatusConflict, ce.Code, ce.Message)
+		return
+	}
+	if err != nil {
+		writeErr(c, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	s.respondBatch(c, http.StatusOK, b, nil)
+}
+
 // projectionJSON carries the non-persistent risk estimate included only when
 // the query carried an asOf parameter.
 type projectionJSON struct {
@@ -295,6 +361,7 @@ func (s *Server) respondBatch(c *gin.Context, status int, b *store.Batch, projec
 		CreatedAt:          b.CreatedAt.UTC().Format(time.RFC3339),
 		LastEvent:          last,
 		Projection:         proj,
+		Location:           b.Location,
 	})
 }
 
@@ -333,4 +400,8 @@ type batchJSON struct {
 	CreatedAt          string          `json:"createdAt"`
 	LastEvent          *eventJSON      `json:"lastEvent"`
 	Projection         *projectionJSON `json:"projection,omitempty"` // present only with ?asOf=...
+	// Location is the cabinet slot currently occupied by the batch; nil when
+	// the batch is unplaced (outside the cabinet / freshly returned / not yet
+	// shelved). The added field is ignored by older clients.
+	Location *string `json:"location"`
 }

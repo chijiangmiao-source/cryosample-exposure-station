@@ -40,5 +40,17 @@ export const api = {
     request(`/batches/${encodeURIComponent(barcode)}/events/${id}/revoke`, {
       method: 'POST',
       body: JSON.stringify(body)
+    }),
+  // Cabinet slot occupancy (independent of the exposure state machine):
+  // PUT places/moves an in-cabinet usable batch into a scanned slot; DELETE
+  // vacates the batch's slot. A takeout releases the slot automatically.
+  putLocation: (barcode, location) =>
+    request(`/batches/${encodeURIComponent(barcode)}/location`, {
+      method: 'PUT',
+      body: JSON.stringify({ location })
+    }),
+  clearLocation: (barcode) =>
+    request(`/batches/${encodeURIComponent(barcode)}/location`, {
+      method: 'DELETE'
     })
 }

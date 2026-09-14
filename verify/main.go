@@ -59,6 +59,9 @@ type batch struct {
 		RevokeReason *string `json:"revokeReason"`
 	} `json:"lastEvent"`
 	Projection *projection `json:"projection"`
+	// Location is the cabinet slot currently occupied by the batch; nil when
+	// unplaced. Decoded but ignored when verifying the legacy timing flow.
+	Location *string `json:"location"`
 }
 
 type projection struct {
@@ -124,6 +127,39 @@ func revokeEvent(barcode string, id int64, at, reason string) (int, batch, apiEr
 		fmt.Sprintf("%s/batches/%s/events/%d/revoke", apiBase, barcode, id),
 		map[string]string{"at": at, "reason": reason})
 	return decodeBatch(code, raw)
+}
+
+// putLocation PUTs a scanned slot code (first placement or move).
+func putLocation(barcode, location string) (int, batch, apiErr) {
+	code, raw := do("PUT", apiBase+"/batches/"+barcode+"/location",
+		map[string]string{"location": location})
+	return decodeBatch(code, raw)
+}
+
+// deleteLocation vacates the batch's current slot.
+func deleteLocation(barcode string) (int, batch, apiErr) {
+	code, raw := do("DELETE", apiBase+"/batches/"+barcode+"/location", nil)
+	return decodeBatch(code, raw)
+}
+
+// putLocationRaw is a goroutine-safe variant returning (status, errorCode).
+func putLocationRaw(barcode, location string) (int, string) {
+	raw, _ := json.Marshal(map[string]string{"location": location})
+	req, _ := http.NewRequest("PUT", apiBase+"/batches/"+barcode+"/location", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	res, err := client.Do(req)
+	if err != nil {
+		return -1, err.Error()
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK {
+		var e apiErr
+		if json.Unmarshal(body, &e) == nil {
+			return res.StatusCode, e.Error.Code
+		}
+	}
+	return res.StatusCode, ""
 }
 
 func listEvents(barcode string) (int, []event) {
@@ -497,6 +533,155 @@ func main() {
 
 	code, _, _ = getBatchAsOf(fmt.Sprintf("NOPE-%d", uniq), "2026-01-01T00:00:00Z")
 	check("unknown barcode with asOf -> 404 not_found", code == 404, fmt.Sprintf("status=%d", code))
+
+	// 9. Independent cabinet-slot occupancy: place, refresh, move (old slot
+	// freed), takeout auto-vacates in the event transaction, return stays
+	// unplaced and can be shelved again; out-of-cabinet / scrapped placement
+	// and an occupied target conflict; concurrent races for one slot produce
+	// exactly one winner. Occupancy failures never move events or exposure.
+	b7 := fmt.Sprintf("VERIFY-G-%d", uniq)
+	b8 := fmt.Sprintf("VERIFY-H-%d", uniq)
+	b9 := fmt.Sprintf("VERIFY-I-%d", uniq)
+	for _, bc := range []string{b7, b8, b9} {
+		code, b, _ = createBatch(bc, 1000, "2026-01-01T00:00:00Z")
+		check("location: create batch "+bc, code == 201 && b.Location == nil, fmt.Sprintf("status=%d loc=%v", code, b.Location))
+	}
+
+	// Slot codes are namespaced per run so the persistent database does not
+	// leak an occupancy from a previous acceptance run.
+	s1 := fmt.Sprintf("SLOT-%d-1", uniq)
+	s2 := fmt.Sprintf("SLOT-%d-2", uniq)
+	s3 := fmt.Sprintf("SLOT-%d-3", uniq)
+	s4 := fmt.Sprintf("SLOT-%d-4", uniq)
+	s5 := fmt.Sprintf("SLOT-%d-5", uniq)
+
+	// First placement, visible on a fresh GET (what the page shows after a refresh).
+	code, b, _ = putLocation(b7, s1)
+	check("first placement into the first slot", code == 200 && b.Location != nil && *b.Location == s1,
+		fmt.Sprintf("status=%d loc=%v", code, b.Location))
+	_, b = getBatch(b7)
+	check("placement survives a refresh (re-readable from server)",
+		b.Location != nil && *b.Location == s1, fmt.Sprintf("loc=%v", b.Location))
+
+	// Another batch fighting for the occupied slot is rejected explicitly.
+	code, _, e = putLocation(b8, s1)
+	check("placement into an occupied slot -> 409 location_occupied",
+		code == 409 && e.Error.Code == "location_occupied", fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+	_, b7v := getBatch(b7)
+	_, b8v := getBatch(b8)
+	check("rejected placement changes no occupancy (holder keeps the slot, loser unplaced)",
+		b7v.Location != nil && *b7v.Location == s1 && b8v.Location == nil,
+		fmt.Sprintf("b7=%v b8=%v", b7v.Location, b8v.Location))
+
+	// Moving releases the old slot inside one transaction; the loser can then take it.
+	code, b, _ = putLocation(b7, s2)
+	check("move b7 to the second slot frees the first",
+		code == 200 && b.Location != nil && *b.Location == s2, fmt.Sprintf("status=%d loc=%v", code, b.Location))
+	code, b, _ = putLocation(b8, s1)
+	check("old slot is reusable after the move",
+		code == 200 && b.Location != nil && *b.Location == s1, fmt.Sprintf("status=%d loc=%v", code, b.Location))
+
+	// Failed move onto an occupied slot keeps the old occupancy untouched.
+	code, _, e = putLocation(b7, s1)
+	check("move onto occupied slot -> 409 and the old slot survives",
+		code == 409 && e.Error.Code == "location_occupied", fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+	_, b7v = getBatch(b7)
+	check("b7 is still on its second slot after the rejected move",
+		b7v.Location != nil && *b7v.Location == s2, fmt.Sprintf("loc=%v", b7v.Location))
+	check("location failures write no events", eventCount(b7) == 0 && eventCount(b8) == 0,
+		fmt.Sprintf("b7=%d b8=%d", eventCount(b7), eventCount(b8)))
+
+	// Takeout auto-vacates in the original event transaction.
+	code, b, _ = postEvent(b7, "takeout", "2026-01-01T00:00:05Z")
+	check("takeout releases the slot in the same transaction",
+		code == 201 && b.State == "out" && b.Location == nil,
+		fmt.Sprintf("status=%d state=%s loc=%v", code, b.State, b.Location))
+	code, b, _ = putLocation(b9, s2)
+	check("auto-vacated slot is immediately placeable by another batch",
+		code == 200 && b.Location != nil && *b.Location == s2, fmt.Sprintf("status=%d loc=%v", code, b.Location))
+
+	// An out-of-cabinet batch cannot be placed.
+	code, _, e = putLocation(b7, s3)
+	check("placing an out-of-cabinet batch -> 409 batch_not_in_cabinet",
+		code == 409 && e.Error.Code == "batch_not_in_cabinet", fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+
+	// A return leaves the batch unplaced ("归还后保持未定位"), then it can be shelved again.
+	code, b, _ = postEvent(b7, "return", "2026-01-01T00:00:15Z")
+	check("return keeps the batch unplaced but in cabinet with exposure counted",
+		code == 201 && b.State == "in" && b.Location == nil && b.AccumulatedSeconds == 10,
+		fmt.Sprintf("status=%d state=%s loc=%v acc=%d", code, b.State, b.Location, b.AccumulatedSeconds))
+	code, b, _ = putLocation(b7, s4)
+	check("returned batch can be placed again",
+		code == 200 && b.Location != nil && *b.Location == s4, fmt.Sprintf("status=%d loc=%v", code, b.Location))
+
+	// Manual 腾空 and its conflict when nothing is held.
+	code, b, _ = deleteLocation(b7)
+	check("manual DELETE vacates the slot, events and exposure untouched",
+		code == 200 && b.Location == nil && b.AccumulatedSeconds == 10 && eventCount(b7) == 2,
+		fmt.Sprintf("status=%d acc=%d events=%d", code, b.AccumulatedSeconds, eventCount(b7)))
+	code, _, e = deleteLocation(b7)
+	check("DELETE while unplaced -> 409 location_not_occupied",
+		code == 409 && e.Error.Code == "location_not_occupied", fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+
+	// Empty location -> 400; unknown batch -> 404.
+	code, raw = do("PUT", apiBase+"/batches/"+b8+"/location", map[string]string{"location": "   "})
+	_ = json.Unmarshal(raw, &e)
+	check("blank location -> 400 location_required",
+		code == 400 && e.Error.Code == "location_required", fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+	code, _, _ = putLocation(fmt.Sprintf("NOPE-%d", uniq), s3)
+	check("location on unknown batch -> 404", code == 404, fmt.Sprintf("status=%d", code))
+
+	// A scrapped in-cabinet batch cannot occupy a slot.
+	b10 := fmt.Sprintf("VERIFY-J-%d", uniq)
+	createBatch(b10, 10, "2026-01-02T00:00:00Z")
+	postEvent(b10, "takeout", "2026-01-02T00:00:05Z")
+	postEvent(b10, "return", "2026-01-02T00:00:16Z") // +11 > 10 -> scrapped
+	code, _, e = putLocation(b10, s5)
+	check("scrapped batch placement -> 409 batch_scrapped",
+		code == 409 && e.Error.Code == "batch_scrapped", fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+
+	// Concurrency: two+ batches racing for one slot — exactly one winner.
+	raceSlot := fmt.Sprintf("RACE-SLOT-%d", uniq)
+	lcodes := make([]int, racers)
+	for i := 0; i < racers; i++ {
+		bc := fmt.Sprintf("VERIFY-K-%d-%d", uniq, i)
+		createBatch(bc, 1000, "2026-01-03T00:00:00Z")
+		wg.Add(1)
+		go func(i int, bc string) {
+			defer wg.Done()
+			lcodes[i], _ = putLocationRaw(bc, raceSlot)
+		}(i, bc)
+	}
+	wg.Wait()
+	check("racing placements: exactly one wins, the rest get location_occupied",
+		countCode(lcodes, 200) == 1 && countCode(lcodes, 409) == racers-1,
+		fmt.Sprintf("codes=%v", lcodes))
+	holders := 0
+	for i := 0; i < racers; i++ {
+		bc := fmt.Sprintf("VERIFY-K-%d-%d", uniq, i)
+		_, rb := getBatch(bc)
+		if rb.Location != nil && *rb.Location == raceSlot {
+			holders++
+		}
+	}
+	check("the ledger shows exactly one batch on the raced slot", holders == 1,
+		fmt.Sprintf("holders=%d", holders))
+
+	// Backwards compatibility: the added "location" key is additive, and an
+	// old client that ignores it keeps the original timing behaviour.
+	var locKeys map[string]json.RawMessage
+	code, raw = do("GET", apiBase+"/batches/"+b8, nil)
+	_ = json.Unmarshal(raw, &locKeys)
+	_, hasLocationKey := locKeys["location"]
+	check("batch responses additively carry the location key",
+		code == 200 && hasLocationKey, fmt.Sprintf("status=%d", code))
+	code, b, _ = postEvent(b8, "takeout", "2026-01-01T01:00:05Z")
+	check("old timing flow unaffected by the added field: takeout accepted",
+		code == 201 && b.State == "out" && b.AccumulatedSeconds == 0, fmt.Sprintf("status=%d state=%s", code, b.State))
+	code, b, _ = postEvent(b8, "return", "2026-01-01T01:00:15Z")
+	check("old timing flow unaffected by the added field: return adds +10",
+		code == 201 && b.State == "in" && b.AccumulatedSeconds == 10 && b.Status == "usable",
+		fmt.Sprintf("status=%d acc=%d status=%s", code, b.AccumulatedSeconds, b.Status))
 
 	if failures > 0 {
 		fmt.Printf("\nverify: %d check(s) FAILED\n", failures)

@@ -4,6 +4,7 @@ import { api } from './api'
 import { isValidZ, nowZ } from './lib/time'
 import { canRevokeEvent, eventTypeLabel, isEventRevoked, projectionConclusion } from './lib/derive'
 import BatchCard from './components/BatchCard.vue'
+import LocationCard from './components/LocationCard.vue'
 
 const barcode = ref('')
 const batch = ref(null)
@@ -30,6 +31,92 @@ const assessEditing = ref(false)
 
 // Inline revocation form for the latest non-revoked event: { id, at, reason }.
 const revokeForm = ref(null)
+
+// Independent cabinet-slot occupancy. These are deliberately separate from
+// the exposure flow: a failed/conflicting placement keeps the loaded batch and
+// the scanned slot draft (held inside LocationCard), only explaining why.
+const locationBusy = ref(false)
+const locationInfo = ref('')
+const locationError = ref('')
+
+function resetLocationMessages() {
+  locationInfo.value = ''
+  locationError.value = ''
+}
+
+function explainLocationError(e) {
+  if (e.status === 409 && e.code === 'location_occupied') {
+    return '目标格位已被其他批次占用（可能刚刚被并发扫码抢先）；本次放置/移位未生效，原格位占用保持不变。'
+  }
+  if (e.status === 409 && e.code === 'batch_not_in_cabinet') {
+    return '该批次当前在柜外，不能占用格位；请先归还，再扫描格位码放置。'
+  }
+  if (e.status === 409 && e.code === 'batch_scrapped') {
+    return '该批次已报废，不能再放入柜内格位。'
+  }
+  if (e.status === 409 && e.code === 'location_not_occupied') {
+    return '该批次当前没有占用任何格位（可能已被其他工位腾空）；已为你刷新服务端状态。'
+  }
+  if (e.status === 404) {
+    return '批次不存在，格位操作未执行。'
+  }
+  return `格位操作失败（${e.code || e.status}）：${e.message}`
+}
+
+// placeLocation handles both the first placement and a move. On conflict the
+// batch stays loaded and the scanned slot draft stays in the input (the card
+// keeps it); we only reload the authoritative batch so another station's
+// occupancy becomes visible. No event is written and no exposure total moves.
+async function placeLocation(code) {
+  if (!batch.value) return
+  resetLocationMessages()
+  error.value = ''
+  locationBusy.value = true
+  const barcode = batch.value.barcode
+  const previous = batch.value.location || null
+  try {
+    const updated = await api.putLocation(barcode, code)
+    batch.value = updated
+    locationInfo.value = previous
+      ? `已移位：旧格位 ${previous} 已腾空，批次「${barcode}」现位于格位 ${code}`
+      : `已放置：批次「${barcode}」现位于格位 ${code}`
+  } catch (e) {
+    locationError.value = explainLocationError(e)
+    try {
+      batch.value = await api.getBatch(barcode)
+    } catch {
+      /* keep the previously loaded batch on screen */
+    }
+  } finally {
+    locationBusy.value = false
+  }
+}
+
+// vacateLocation is the manual 腾空 operation. A takeout vacates the slot
+// implicitly inside its own event transaction; this endpoint only releases
+// the occupancy, touching neither events nor accumulated exposure.
+async function vacateLocation() {
+  if (!batch.value || !batch.value.location) return
+  resetLocationMessages()
+  error.value = ''
+  locationBusy.value = true
+  const barcode = batch.value.barcode
+  const oldSlot = batch.value.location
+  try {
+    const updated = await api.clearLocation(barcode)
+    batch.value = updated
+    locationInfo.value = `已腾空格位 ${oldSlot}；批次仍在柜内，当前为未定位状态。`
+  } catch (e) {
+    locationError.value = explainLocationError(e)
+    try {
+      batch.value = await api.getBatch(barcode)
+    } catch {
+      /* keep the previously loaded batch on screen */
+    }
+  } finally {
+    locationBusy.value = false
+  }
+}
 
 // Create form (shown when the scanned barcode is unknown).
 const showCreate = ref(false)
@@ -98,6 +185,7 @@ async function lookup() {
   info.value = ''
   showCreate.value = false
   revokeForm.value = null
+  resetLocationMessages()
   const code = barcode.value.trim()
   if (!code) {
     error.value = '请输入或扫描批次条码'
@@ -130,6 +218,7 @@ async function lookup() {
 async function submitCreate() {
   error.value = ''
   info.value = ''
+  resetLocationMessages()
   const code = barcode.value.trim()
   if (!Number.isInteger(createAllowed.value) || createAllowed.value <= 0) {
     error.value = '允许暴露秒数必须是正整数'
@@ -175,6 +264,7 @@ async function submitCreate() {
 async function act(type) {
   error.value = ''
   info.value = ''
+  resetLocationMessages()
   if (!batch.value) return
   if (!isValidZ(eventTime.value)) {
     error.value = '事件时间必须是带 Z 的 RFC3339 整秒，如 2026-09-13T08:00:00Z'
@@ -182,11 +272,18 @@ async function act(type) {
   }
   busy.value = true
   const at = eventTime.value
+  const hadSlot = !!batch.value.location
   try {
     batch.value = await api.postEvent(batch.value.barcode, { type, at })
     revokeForm.value = null
     await refreshEvents()
-    info.value = type === 'takeout' ? '已取出（柜外计时开始）' : '已归还（本次暴露已计入）'
+    if (type === 'takeout') {
+      info.value = hadSlot
+        ? '已取出（柜外计时开始）；批次原占格位已在同一事务中自动腾空'
+        : '已取出（柜外计时开始）'
+    } else {
+      info.value = '已归还（本次暴露已计入）；批次当前未定位，请扫描格位码放置'
+    }
     // Only reset the field when it still holds the submitted value, so a
     // fast follow-up edit made while the request was in flight survives.
     if (eventTime.value === at) {
@@ -229,6 +326,7 @@ function cancelRevoke() {
 async function submitRevoke() {
   error.value = ''
   info.value = ''
+  resetLocationMessages()
   if (!batch.value || !revokeForm.value) return
   const f = revokeForm.value
   if (!isValidZ(f.at)) {
@@ -332,6 +430,15 @@ onMounted(async () => {
       </div>
 
       <BatchCard :batch="batch" :busy="busy" @takeout="act('takeout')" @return="act('return')" />
+
+      <LocationCard
+        :batch="batch"
+        :busy="busy || locationBusy"
+        :result-text="locationError || locationInfo"
+        :result-kind="locationError ? 'error' : (locationInfo ? 'info' : '')"
+        @place="placeLocation"
+        @clear="vacateLocation"
+      />
 
       <section class="card assess" data-test="assess-card">
         <h2>暴露风险评估（仅提示）</h2>
