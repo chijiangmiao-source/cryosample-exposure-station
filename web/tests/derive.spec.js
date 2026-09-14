@@ -7,6 +7,10 @@ import {
   isEventRevoked,
   isUsable,
   latestActiveEvent,
+  projectionConclusion,
+  projectionIsProjected,
+  projectionOf,
+  projectionOverLimit,
   remainingSeconds,
   stateLabel,
   statusLabel
@@ -81,5 +85,49 @@ describe('derive', () => {
     expect(latestActiveEvent([])).toBeNull()
     expect(latestActiveEvent(null)).toBeNull()
     expect(canRevokeEvent(null, [takeout])).toBe(false)
+  })
+
+  it('asOf projection helpers distinguish projected vs settled figures', () => {
+    const projectedOk = {
+      asOf: '2026-09-13T08:00:15Z', accumulatedSeconds: 10, remainingSeconds: 0,
+      usable: true, projectedOverLimit: false, settled: false
+    }
+    const projectedOver = {
+      asOf: '2026-09-13T08:00:16Z', accumulatedSeconds: 11, remainingSeconds: -1,
+      usable: false, projectedOverLimit: true, settled: false
+    }
+    const settledUsable = {
+      asOf: '2026-09-13T09:00:00Z', accumulatedSeconds: 30, remainingSeconds: 70,
+      usable: true, projectedOverLimit: false, settled: true
+    }
+    const settledScrapped = {
+      asOf: '2026-09-13T09:00:00Z', accumulatedSeconds: 101, remainingSeconds: -1,
+      usable: false, projectedOverLimit: true, settled: true
+    }
+
+    // projectionOf reads the optional field and is null-safe.
+    expect(projectionOf({ ...base, projection: projectedOk })).toBe(projectedOk)
+    expect(projectionOf(base)).toBeNull()
+    expect(projectionOf(null)).toBeNull()
+
+    // Settled vs open-takeout projection.
+    expect(projectionIsProjected(projectedOk)).toBe(true)
+    expect(projectionIsProjected(projectedOver)).toBe(true)
+    expect(projectionIsProjected(settledUsable)).toBe(false)
+    expect(projectionIsProjected(settledScrapped)).toBe(false)
+    expect(projectionIsProjected(null)).toBe(false)
+
+    // Over-limit follows the projected usability, not the batch status.
+    expect(projectionOverLimit(projectedOk)).toBe(false)
+    expect(projectionOverLimit(projectedOver)).toBe(true)
+    expect(projectionOverLimit(settledScrapped)).toBe(true)
+    expect(projectionOverLimit(null)).toBe(false)
+
+    // Operator-facing wording.
+    expect(projectionConclusion(projectedOk)).toBe('预计可用')
+    expect(projectionConclusion(projectedOver)).toBe('已预计超限')
+    expect(projectionConclusion(settledUsable)).toBe('已结算·可用')
+    expect(projectionConclusion(settledScrapped)).toBe('已结算·已报废')
+    expect(projectionConclusion(null)).toBe('')
   })
 })

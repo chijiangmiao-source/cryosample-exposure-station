@@ -243,6 +243,53 @@ func scanBatch(row *sql.Row) (*Batch, error) {
 	return &b, nil
 }
 
+// Projection is a read-only risk estimate of a batch's exposure totals at a
+// given time. It is never persisted and never changes the batch: a projected
+// over-limit result does not scrap anything.
+type Projection struct {
+	AsOf time.Time
+	// AccumulatedSeconds is the settled total for an in-cabinet batch, or the
+	// settled accumulated seconds plus the open takeout's elapsed seconds for
+	// a batch currently out.
+	AccumulatedSeconds int64
+	RemainingSeconds   int64
+	Usable             bool
+	// Settled is true for in-cabinet batches: the figures are already settled
+	// totals rather than a projection over an open takeout.
+	Settled bool
+}
+
+// EvaluateAt returns a batch together with a non-persistent exposure
+// evaluation at asOf. For a batch out of the cabinet it projects the total
+// from the settled accumulated seconds and the still-open takeout time; for a
+// batch inside the cabinet it returns the settled totals. It fails with a
+// time_not_monotonic ConflictError when asOf is earlier than the batch's last
+// event (or its creation time when it has no events). Nothing is written: the
+// event log, accumulated total, status and subsequent timing are unaffected.
+func (s *Store) EvaluateAt(ctx context.Context, barcode string, asOf time.Time) (*Batch, *Projection, error) {
+	b, err := s.GetBatch(ctx, barcode)
+	if err != nil {
+		return nil, nil, err
+	}
+	if asOf.Before(b.LastAt) {
+		return nil, nil, conflict("time_not_monotonic",
+			"evaluation time %s must not be earlier than the batch's last event time %s",
+			ts(asOf), ts(b.LastAt))
+	}
+	p := &Projection{
+		AsOf:               asOf,
+		AccumulatedSeconds: b.AccumulatedSeconds,
+	}
+	if b.State == StateOut && b.LastTakeoutAt != nil {
+		p.AccumulatedSeconds += int64(asOf.Sub(*b.LastTakeoutAt).Seconds())
+	} else {
+		p.Settled = true
+	}
+	p.RemainingSeconds = b.AllowedSeconds - p.AccumulatedSeconds
+	p.Usable = p.AccumulatedSeconds <= b.AllowedSeconds
+	return b, p, nil
+}
+
 // ListEvents returns the whole event log of a batch in insertion order,
 // including revoked events with their revocation audit fields.
 func (s *Store) ListEvents(ctx context.Context, barcode string) ([]Event, error) {

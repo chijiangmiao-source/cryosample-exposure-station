@@ -52,3 +52,35 @@ export function canRevokeEvent(ev, events) {
   const latest = latestActiveEvent(events)
   return !!ev && !isEventRevoked(ev) && !!latest && latest.id === ev.id
 }
+
+// --- asOf risk projection ---------------------------------------------------
+// The projection is advisory only: it never scraps a batch and never changes
+// state/status; 取出/归还 keep working off the persistent batch fields.
+
+/** 批次响应中携带的评估结果（仅 ?asOf= 查询时存在）。 */
+export function projectionOf(batch) {
+  return batch && typeof batch === 'object' ? batch.projection || null : null
+}
+
+/** 评估结论是否基于未闭合取出（false 时为柜内已结算数值）。 */
+export function projectionIsProjected(proj) {
+  return !!proj && proj.settled === false
+}
+
+/** 预计/已结算累计是否已超过上限。 */
+export function projectionOverLimit(proj) {
+  return !!proj && proj.usable === false
+}
+
+/**
+ * 面向值班员的评估结论文案：
+ * - 柜外预计：预计可用 / 已预计超限
+ * - 柜内已结算：已结算·可用 / 已结算·已报废
+ */
+export function projectionConclusion(proj) {
+  if (!proj) return ''
+  if (proj.settled) {
+    return proj.usable ? '已结算·可用' : '已结算·已报废'
+  }
+  return proj.usable ? '预计可用' : '已预计超限'
+}

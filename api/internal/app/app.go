@@ -112,10 +112,15 @@ func (s *Server) createBatch(c *gin.Context) {
 		writeErr(c, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	s.respondBatch(c, http.StatusCreated, b)
+	s.respondBatch(c, http.StatusCreated, b, nil)
 }
 
 func (s *Server) getBatch(c *gin.Context) {
+	// Optional asOf projects the exposure totals at the given time without
+	// persisting anything. Absent/empty: the response keeps its old semantics
+	// (settled values only); malformed: 400 invalid_time; earlier than the
+	// batch's last event: 409 time_not_monotonic.
+	rawAsOf, hasAsOf := c.GetQuery("asOf")
 	b, err := s.st.GetBatch(c.Request.Context(), c.Param("barcode"))
 	if errors.Is(err, store.ErrNotFound) {
 		writeErr(c, http.StatusNotFound, "not_found", "no batch with this barcode")
@@ -125,7 +130,25 @@ func (s *Server) getBatch(c *gin.Context) {
 		writeErr(c, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	s.respondBatch(c, http.StatusOK, b)
+	var projection *store.Projection
+	if hasAsOf && rawAsOf != "" {
+		asOf, err := parseEventTime(rawAsOf)
+		if err != nil {
+			writeErr(c, http.StatusBadRequest, "invalid_time", err.Error())
+			return
+		}
+		_, projection, err = s.st.EvaluateAt(c.Request.Context(), b.Barcode, asOf)
+		var ce *store.ConflictError
+		if errors.As(err, &ce) {
+			writeErr(c, http.StatusConflict, ce.Code, ce.Message)
+			return
+		}
+		if err != nil {
+			writeErr(c, http.StatusInternalServerError, "internal", err.Error())
+			return
+		}
+	}
+	s.respondBatch(c, http.StatusOK, b, projection)
 }
 
 func (s *Server) listEvents(c *gin.Context) {
@@ -180,7 +203,7 @@ func (s *Server) createEvent(c *gin.Context) {
 		writeErr(c, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	s.respondBatch(c, http.StatusCreated, b)
+	s.respondBatch(c, http.StatusCreated, b, nil)
 }
 
 type revokeEventReq struct {
@@ -226,15 +249,39 @@ func (s *Server) revokeEvent(c *gin.Context) {
 		writeErr(c, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	s.respondBatch(c, http.StatusOK, b)
+	s.respondBatch(c, http.StatusOK, b, nil)
 }
 
-// respondBatch renders the batch together with its latest event (if any).
-func (s *Server) respondBatch(c *gin.Context, status int, b *store.Batch) {
+// projectionJSON carries the non-persistent risk estimate included only when
+// the query carried an asOf parameter.
+type projectionJSON struct {
+	AsOf               string `json:"asOf"`
+	AccumulatedSeconds int64  `json:"accumulatedSeconds"`
+	RemainingSeconds   int64  `json:"remainingSeconds"`
+	Usable             bool   `json:"usable"`
+	ProjectedOverLimit bool   `json:"projectedOverLimit"`
+	Settled            bool   `json:"settled"`
+}
+
+// respondBatch renders the batch together with its latest event (if any). When
+// projection is non-nil the response additionally carries the asOf evaluation;
+// the batch's own settled fields are never altered by it.
+func (s *Server) respondBatch(c *gin.Context, status int, b *store.Batch, projection *store.Projection) {
 	var last *eventJSON
 	if ev, err := s.st.LastEvent(c.Request.Context(), b.Barcode); err == nil && ev != nil {
 		e := toEventJSON(ev)
 		last = &e
+	}
+	var proj *projectionJSON
+	if projection != nil {
+		proj = &projectionJSON{
+			AsOf:               projection.AsOf.UTC().Format(time.RFC3339),
+			AccumulatedSeconds: projection.AccumulatedSeconds,
+			RemainingSeconds:   projection.RemainingSeconds,
+			Usable:             projection.Usable,
+			ProjectedOverLimit: !projection.Usable,
+			Settled:            projection.Settled,
+		}
 	}
 	c.JSON(status, batchJSON{
 		Barcode:            b.Barcode,
@@ -246,6 +293,7 @@ func (s *Server) respondBatch(c *gin.Context, status int, b *store.Batch) {
 		RemainingSeconds:   b.AllowedSeconds - b.AccumulatedSeconds,
 		CreatedAt:          b.CreatedAt.UTC().Format(time.RFC3339),
 		LastEvent:          last,
+		Projection:         proj,
 	})
 }
 
@@ -274,13 +322,14 @@ func toEventJSON(ev *store.Event) eventJSON {
 }
 
 type batchJSON struct {
-	Barcode            string     `json:"barcode"`
-	AllowedSeconds     int64      `json:"allowedSeconds"`
-	State              string     `json:"state"`  // "in" | "out"
-	Status             string     `json:"status"` // "usable" | "scrapped"
-	Usable             bool       `json:"usable"` // status == "usable"
-	AccumulatedSeconds int64      `json:"accumulatedSeconds"`
-	RemainingSeconds   int64      `json:"remainingSeconds"` // allowedSeconds - accumulatedSeconds
-	CreatedAt          string     `json:"createdAt"`
-	LastEvent          *eventJSON `json:"lastEvent"`
+	Barcode            string          `json:"barcode"`
+	AllowedSeconds     int64           `json:"allowedSeconds"`
+	State              string          `json:"state"`  // "in" | "out"
+	Status             string          `json:"status"` // "usable" | "scrapped"
+	Usable             bool            `json:"usable"` // status == "usable"
+	AccumulatedSeconds int64           `json:"accumulatedSeconds"`
+	RemainingSeconds   int64           `json:"remainingSeconds"` // allowedSeconds - accumulatedSeconds
+	CreatedAt          string          `json:"createdAt"`
+	LastEvent          *eventJSON      `json:"lastEvent"`
+	Projection         *projectionJSON `json:"projection,omitempty"` // present only with ?asOf=...
 }

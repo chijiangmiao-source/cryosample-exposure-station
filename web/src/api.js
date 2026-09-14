@@ -23,7 +23,13 @@ export const api = {
   health: () => request('/health'),
   createBatch: (body) =>
     request('/batches', { method: 'POST', body: JSON.stringify(body) }),
-  getBatch: (barcode) => request(`/batches/${encodeURIComponent(barcode)}`),
+  getBatch: (barcode, asOf) => {
+    // asOf is an optional RFC3339 whole-second "Z" timestamp: when present the
+    // server adds a non-persistent risk projection (?asOf=...); omitted, the
+    // response keeps its settled-values-only semantics.
+    const qs = asOf ? `?asOf=${encodeURIComponent(asOf)}` : ''
+    return request(`/batches/${encodeURIComponent(barcode)}${qs}`)
+  },
   listEvents: (barcode) => request(`/batches/${encodeURIComponent(barcode)}/events`),
   postEvent: (barcode, body) =>
     request(`/batches/${encodeURIComponent(barcode)}/events`, {

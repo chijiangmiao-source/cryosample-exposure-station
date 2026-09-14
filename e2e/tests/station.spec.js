@@ -31,11 +31,15 @@ async function scan(page, barcode) {
 async function takeout(page, at) {
   await page.getByTestId('event-time').fill(at)
   await page.getByTestId('takeout-btn').click()
+  // Wait for the automatic asOf assessment after the state change to settle so
+  // it cannot reset the 评估至 field after the test starts editing it.
+  await expect(page.getByTestId('assess-result')).toBeVisible()
 }
 
 async function doReturn(page, at) {
   await page.getByTestId('event-time').fill(at)
   await page.getByTestId('return-btn').click()
+  await expect(page.getByTestId('assess-result')).toBeVisible()
 }
 
 // Only the latest non-revoked event renders a revoke button, so the button
@@ -221,6 +225,122 @@ test('非最近事件不提供撤销入口，直接撤销被服务端 409 拒绝
   await page.reload()
   await expect(page.getByTestId('accumulated')).toHaveText('10 秒')
   await expect(page.locator('button[data-test^="revoke-btn-"]')).toHaveCount(1)
+})
+
+test('柜外风险评估随评估时刻增长并跨过上限，但不落库；原接口归还是否才真正累计报废', async ({ page, request }) => {
+  const barcode = nextBarcode('ASSESS')
+  await createBatch(page, barcode, 10)
+  await takeout(page, '2026-01-01T00:00:05Z')
+  await expect(page.getByTestId('state-badge')).toHaveText('柜外')
+
+  // 查到柜外批次后自动出现评估区（评估至默认当前整秒）
+  await expect(page.getByTestId('assess-card')).toBeVisible()
+  await expect(page.getByTestId('assess-result')).toBeVisible()
+
+  // 改评估时刻重算：+1 秒 -> 预计累计 1，预计可用
+  await page.getByTestId('assess-time').fill('2026-01-01T00:00:06Z')
+  await page.getByTestId('assess-btn').click()
+  await expect(page.getByTestId('assess-asof')).toHaveText('2026-01-01T00:00:06Z')
+  await expect(page.getByTestId('assess-accumulated')).toHaveText('1 秒')
+  await expect(page.getByTestId('assess-remaining')).toHaveText('9 秒')
+  await expect(page.getByTestId('assess-conclusion')).toHaveText('预计可用')
+  expect(await page.getByTestId('assess-over-limit').count()).toBe(0)
+
+  // 恰好上限：累计 10 == 允许 10，仍预计可用
+  await page.getByTestId('assess-time').fill('2026-01-01T00:00:15Z')
+  await page.getByTestId('assess-btn').click()
+  await expect(page.getByTestId('assess-accumulated')).toHaveText('10 秒')
+  await expect(page.getByTestId('assess-remaining')).toHaveText('0 秒')
+  await expect(page.getByTestId('assess-conclusion')).toHaveText('预计可用')
+
+  // 再走一秒跨过上限：明确提示“已预计超限”
+  await page.getByTestId('assess-time').fill('2026-01-01T00:00:16Z')
+  await page.getByTestId('assess-btn').click()
+  await expect(page.getByTestId('assess-accumulated')).toHaveText('11 秒')
+  await expect(page.getByTestId('assess-remaining')).toHaveText('-1 秒')
+  await expect(page.getByTestId('assess-over-limit')).toHaveText('已预计超限')
+
+  // 评估只是提示：持久状态仍是柜外·可用，取出/归还按钮按持久状态工作
+  await expect(page.getByTestId('state-badge')).toHaveText('柜外')
+  await expect(page.getByTestId('status-badge')).toHaveText('可用')
+  await expect(page.getByTestId('accumulated')).toHaveText('0 秒')
+  await expect(page.getByTestId('return-btn')).toBeEnabled()
+  await expect(page.getByTestId('takeout-btn')).toBeDisabled()
+
+  // 多次评估没有写入任何事件
+  const evsRes = await request.get(`/api/batches/${barcode}/events`)
+  expect((await evsRes.json()).events).toHaveLength(1)
+
+  // 通过原有归还接口在 +11 秒归还，才真正累计 11 秒并报废
+  await doReturn(page, '2026-01-01T00:00:16Z')
+  await expect(page.getByTestId('state-badge')).toHaveText('柜内')
+  await expect(page.getByTestId('accumulated')).toHaveText('11 秒')
+  await expect(page.getByTestId('status-badge')).toHaveText('已报废')
+  // 柜内评估返回已结算数值
+  await expect(page.getByTestId('assess-accumulated')).toHaveText('11 秒')
+  await expect(page.getByTestId('assess-conclusion')).toContainText('已结算·已报废')
+
+  const evsRes2 = await request.get(`/api/batches/${barcode}/events`)
+  expect((await evsRes2.json()).events).toHaveLength(2)
+})
+
+test('评估时刻非法或早于最后事件时就地解释失败，批次与流水不受影响', async ({ page }) => {
+  const barcode = nextBarcode('ASSESS-ERR')
+  await createBatch(page, barcode, 100)
+  await takeout(page, '2026-01-01T00:00:10Z')
+
+  // 格式非法：前端直接拦截，不发请求
+  await page.getByTestId('assess-time').fill('2026-01-01T00:00:20+08:00')
+  await page.getByTestId('assess-btn').click()
+  await expect(page.getByTestId('assess-error')).toContainText('RFC3339')
+  await expect(page.getByTestId('state-badge')).toHaveText('柜外')
+
+  // 改为合法但早于最后事件：服务端 409，就地解释，已加载批次保留
+  await page.getByTestId('assess-time').fill('2026-01-01T00:00:09Z')
+  await page.getByTestId('assess-btn').click()
+  await expect(page.getByTestId('assess-error')).toContainText('早于该批次最后事件')
+  // 旧的评估结果已清空，但批次卡片保持不变
+  await expect(page.getByTestId('assess-result')).toBeHidden()
+  await expect(page.getByTestId('state-badge')).toHaveText('柜外')
+  await expect(page.getByTestId('accumulated')).toHaveText('0 秒')
+  await expect(page.getByTestId('return-btn')).toBeEnabled()
+
+  // 修正为合法时刻后重算成功，失败提示消失
+  await page.getByTestId('assess-time').fill('2026-01-01T00:00:20Z')
+  await page.getByTestId('assess-btn').click()
+  await expect(page.getByTestId('assess-accumulated')).toHaveText('10 秒')
+  await expect(page.getByTestId('assess-error')).toBeHidden()
+})
+
+test('柜内批次评估返回已结算数值，不带 asOf 的旧查询保持兼容', async ({ page, request }) => {
+  const barcode = nextBarcode('ASSESS-IN')
+  await createBatch(page, barcode, 100)
+  await takeout(page, '2026-01-01T00:00:10Z')
+  await doReturn(page, '2026-01-01T00:00:40Z') // +30，柜内
+
+  // 柜内：评估不随时刻增长，显示已结算
+  await page.getByTestId('assess-time').fill('2026-01-02T00:00:00Z')
+  await page.getByTestId('assess-btn').click()
+  await expect(page.getByTestId('assess-accumulated')).toHaveText('30 秒')
+  await expect(page.getByTestId('assess-remaining')).toHaveText('70 秒')
+  await expect(page.getByTestId('assess-conclusion')).toHaveText('已结算·可用')
+
+  // 旧查询（无 asOf）响应中没有 projection 字段
+  const res = await request.get(`/api/batches/${barcode}`)
+  expect(res.status()).toBe(200)
+  const body = await res.json()
+  expect(body.projection).toBeUndefined()
+  expect(body.accumulatedSeconds).toBe(30)
+
+  // 非法 asOf 返回 400 invalid_time
+  const bad = await request.get(`/api/batches/${barcode}?asOf=2026-01-02T00:00:00.5Z`)
+  expect(bad.status()).toBe(400)
+  expect((await bad.json()).error.code).toBe('invalid_time')
+
+  // 早于最后事件返回 409 time_not_monotonic
+  const early = await request.get(`/api/batches/${barcode}?asOf=2026-01-01T00:00:39Z`)
+  expect(early.status()).toBe(409)
+  expect((await early.json()).error.code).toBe('time_not_monotonic')
 })
 
 test('两个工位并发撤销同一最近事件，仅一次成功且不改变失败方累计', async ({ context, page }) => {

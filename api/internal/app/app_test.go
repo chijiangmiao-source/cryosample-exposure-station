@@ -39,6 +39,14 @@ type batchResp struct {
 		RevokedAt    *string `json:"revokedAt"`
 		RevokeReason *string `json:"revokeReason"`
 	} `json:"lastEvent"`
+	Projection *struct {
+		AsOf               string `json:"asOf"`
+		AccumulatedSeconds int64  `json:"accumulatedSeconds"`
+		RemainingSeconds   int64  `json:"remainingSeconds"`
+		Usable             bool   `json:"usable"`
+		ProjectedOverLimit bool   `json:"projectedOverLimit"`
+		Settled            bool   `json:"settled"`
+	} `json:"projection"`
 }
 
 type errResp struct {
@@ -125,6 +133,17 @@ func getBatch(t *testing.T, srv *httptest.Server, barcode string) batchResp {
 	var b batchResp
 	require.NoError(t, json.Unmarshal(raw, &b))
 	return b
+}
+
+// getBatchRaw GETs a batch with an optional raw query string (e.g. asOf) and
+// returns the raw status/body.
+func getBatchRaw(t *testing.T, srv *httptest.Server, barcode, query string) (int, []byte) {
+	t.Helper()
+	url := srv.URL + "/api/batches/" + barcode
+	if query != "" {
+		url += "?" + query
+	}
+	return doJSON(t, http.MethodGet, url, nil)
 }
 
 func listEvents(t *testing.T, srv *httptest.Server, barcode string) eventsResp {
@@ -238,6 +257,196 @@ func TestGetUnknownBatch(t *testing.T) {
 	var e errResp
 	require.NoError(t, json.Unmarshal(raw, &e))
 	assert.Equal(t, "not_found", e.Error.Code)
+}
+
+// --- asOf projection (non-persistent risk evaluation) -------------------------
+
+func TestGetBatchWithoutAsOfKeepsLegacySemantics(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "Q-0", 10, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "Q-0", "takeout", "2026-09-13T08:00:05Z")
+
+	b := getBatch(t, srv, "Q-0")
+	assert.Nil(t, b.Projection, "no projection field without asOf")
+	assert.Equal(t, int64(0), b.AccumulatedSeconds, "settled totals are returned")
+	assert.Equal(t, int64(10), b.RemainingSeconds)
+	assert.Equal(t, "out", b.State)
+	assert.Equal(t, "usable", b.Status)
+
+	// Explicitly empty asOf is treated the same as absent.
+	code, raw := getBatchRaw(t, srv, "Q-0", "asOf=")
+	require.Equal(t, http.StatusOK, code)
+	require.NoError(t, json.Unmarshal(raw, &b))
+	assert.Nil(t, b.Projection)
+}
+
+func TestProjectionGrowsWithAsOfAndCrossesTheLimit(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "Q-1", 10, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "Q-1", "takeout", "2026-09-13T08:00:05Z")
+
+	// One second into the open takeout: projected 1/10.
+	code, raw := getBatchRaw(t, srv, "Q-1", "asOf=2026-09-13T08:00:06Z")
+	require.Equal(t, http.StatusOK, code)
+	var b batchResp
+	require.NoError(t, json.Unmarshal(raw, &b))
+	require.NotNil(t, b.Projection)
+	assert.Equal(t, "2026-09-13T08:00:06Z", b.Projection.AsOf)
+	assert.Equal(t, int64(1), b.Projection.AccumulatedSeconds)
+	assert.Equal(t, int64(9), b.Projection.RemainingSeconds)
+	assert.True(t, b.Projection.Usable)
+	assert.False(t, b.Projection.ProjectedOverLimit)
+	assert.False(t, b.Projection.Settled)
+	// Settled batch fields stay untouched while the projection is over limit.
+	assert.Equal(t, int64(0), b.AccumulatedSeconds)
+	assert.Equal(t, int64(10), b.RemainingSeconds)
+	assert.Equal(t, "usable", b.Status)
+
+	// Exactly at the limit: still usable.
+	code, raw = getBatchRaw(t, srv, "Q-1", "asOf=2026-09-13T08:00:15Z")
+	require.Equal(t, http.StatusOK, code)
+	require.NoError(t, json.Unmarshal(raw, &b))
+	require.NotNil(t, b.Projection)
+	assert.Equal(t, int64(10), b.Projection.AccumulatedSeconds)
+	assert.Equal(t, int64(0), b.Projection.RemainingSeconds)
+	assert.True(t, b.Projection.Usable)
+	assert.False(t, b.Projection.ProjectedOverLimit)
+
+	// One second past the limit: projected over limit, but nothing is scrapped.
+	code, raw = getBatchRaw(t, srv, "Q-1", "asOf=2026-09-13T08:00:16Z")
+	require.Equal(t, http.StatusOK, code)
+	require.NoError(t, json.Unmarshal(raw, &b))
+	require.NotNil(t, b.Projection)
+	assert.Equal(t, int64(11), b.Projection.AccumulatedSeconds)
+	assert.Equal(t, int64(-1), b.Projection.RemainingSeconds)
+	assert.False(t, b.Projection.Usable)
+	assert.True(t, b.Projection.ProjectedOverLimit)
+	assert.Equal(t, "usable", b.Status, "a projection must not scrap the batch")
+	assert.Equal(t, "out", b.State)
+
+	// The real return then settles the exposure and scraps the batch.
+	code, rb, _ := postEvent(t, srv, "Q-1", "return", "2026-09-13T08:00:16Z")
+	require.Equal(t, http.StatusCreated, code)
+	assert.Equal(t, int64(11), rb.AccumulatedSeconds)
+	assert.Equal(t, "scrapped", rb.Status)
+	assert.Nil(t, rb.Projection, "POST /events never carries a projection")
+	assert.Len(t, listEvents(t, srv, "Q-1").Events, 2, "evaluations write no events")
+}
+
+func TestProjectionAddsOntoSettledAccumulated(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "Q-2", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "Q-2", "takeout", "2026-09-13T08:00:10Z")
+	postEvent(t, srv, "Q-2", "return", "2026-09-13T08:00:40Z") // +30 settled
+	postEvent(t, srv, "Q-2", "takeout", "2026-09-13T08:01:00Z")
+
+	code, raw := getBatchRaw(t, srv, "Q-2", "asOf=2026-09-13T08:01:30Z")
+	require.Equal(t, http.StatusOK, code)
+	var b batchResp
+	require.NoError(t, json.Unmarshal(raw, &b))
+	require.NotNil(t, b.Projection)
+	assert.Equal(t, int64(60), b.Projection.AccumulatedSeconds, "30 settled + 30 open")
+	assert.Equal(t, int64(40), b.Projection.RemainingSeconds)
+	assert.True(t, b.Projection.Usable)
+	assert.False(t, b.Projection.Settled)
+	assert.Equal(t, int64(30), b.AccumulatedSeconds, "settled total unchanged")
+}
+
+func TestProjectionForInCabinetBatchReturnsSettledValues(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "Q-3", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "Q-3", "takeout", "2026-09-13T08:00:10Z")
+	postEvent(t, srv, "Q-3", "return", "2026-09-13T08:00:40Z") // +30, in cabinet
+
+	// At the last event time itself the evaluation must succeed (not earlier).
+	code, raw := getBatchRaw(t, srv, "Q-3", "asOf=2026-09-13T08:00:40Z")
+	require.Equal(t, http.StatusOK, code)
+	var b batchResp
+	require.NoError(t, json.Unmarshal(raw, &b))
+	require.NotNil(t, b.Projection)
+	assert.True(t, b.Projection.Settled)
+	assert.Equal(t, int64(30), b.Projection.AccumulatedSeconds)
+	assert.Equal(t, int64(70), b.Projection.RemainingSeconds)
+	assert.True(t, b.Projection.Usable)
+	assert.False(t, b.Projection.ProjectedOverLimit)
+
+	// A much later asOf changes nothing for an in-cabinet batch: there is no
+	// open takeout to extend.
+	code, raw = getBatchRaw(t, srv, "Q-3", "asOf=2026-09-13T09:00:00Z")
+	require.Equal(t, http.StatusOK, code)
+	require.NoError(t, json.Unmarshal(raw, &b))
+	require.NotNil(t, b.Projection)
+	assert.Equal(t, int64(30), b.Projection.AccumulatedSeconds)
+	assert.True(t, b.Projection.Settled)
+
+	// A scrapped in-cabinet batch reports settled, unusable figures.
+	postEvent(t, srv, "Q-3", "takeout", "2026-09-13T08:01:00Z")
+	postEvent(t, srv, "Q-3", "return", "2026-09-13T08:02:11Z") // +71 -> 101 > 100
+	b = getBatch(t, srv, "Q-3")
+	require.Equal(t, "scrapped", b.Status)
+	code, raw = getBatchRaw(t, srv, "Q-3", "asOf=2026-09-13T08:03:00Z")
+	require.Equal(t, http.StatusOK, code)
+	require.NoError(t, json.Unmarshal(raw, &b))
+	require.NotNil(t, b.Projection)
+	assert.True(t, b.Projection.Settled)
+	assert.Equal(t, int64(101), b.Projection.AccumulatedSeconds)
+	assert.False(t, b.Projection.Usable)
+	assert.True(t, b.Projection.ProjectedOverLimit)
+}
+
+func TestProjectionBeforeLastEventConflicts(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "Q-4", 100, "2026-09-13T08:00:00Z")
+
+	// Before the first event the floor is the creation time.
+	code, _, e := getBatchAsOfErr(t, srv, "Q-4", "2026-09-13T07:59:59Z")
+	assert.Equal(t, http.StatusConflict, code)
+	assert.Equal(t, "time_not_monotonic", e.Error.Code)
+
+	postEvent(t, srv, "Q-4", "takeout", "2026-09-13T08:00:10Z")
+	code, _, e = getBatchAsOfErr(t, srv, "Q-4", "2026-09-13T08:00:09Z")
+	assert.Equal(t, http.StatusConflict, code)
+	assert.Equal(t, "time_not_monotonic", e.Error.Code)
+
+	// The rejected evaluation leaves the batch exactly as it was.
+	b := getBatch(t, srv, "Q-4")
+	assert.Equal(t, "out", b.State)
+	assert.Equal(t, int64(0), b.AccumulatedSeconds)
+	assert.Len(t, listEvents(t, srv, "Q-4").Events, 1)
+}
+
+func TestProjectionInvalidTimeIsBadRequest(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "Q-5", 100, "2026-09-13T08:00:00Z")
+	for _, q := range []string{
+		"asOf=2026-09-13T08:00:00",         // missing Z
+		"asOf=2026-09-13T08:00:00%2B08:00", // offset
+		"asOf=2026-09-13T08:00:00.000Z",    // fractional seconds
+		"asOf=not-a-time",
+	} {
+		code, raw := getBatchRaw(t, srv, "Q-5", q)
+		assert.Equal(t, http.StatusBadRequest, code, "query=%s", q)
+		var e errResp
+		require.NoError(t, json.Unmarshal(raw, &e))
+		assert.Equal(t, "invalid_time", e.Error.Code, "query=%s", q)
+	}
+	// Not-found still wins over a malformed asOf only when the batch is absent;
+	// validation order keeps unknown barcodes at 404 regardless of asOf.
+	code, raw := getBatchRaw(t, srv, "GHOST", "asOf=garbage")
+	assert.Equal(t, http.StatusNotFound, code, string(raw))
+}
+
+func getBatchAsOfErr(t *testing.T, srv *httptest.Server, barcode, asOf string) (int, batchResp, errResp) {
+	t.Helper()
+	code, raw := getBatchRaw(t, srv, barcode, "asOf="+asOf)
+	var b batchResp
+	var e errResp
+	if code == http.StatusOK {
+		require.NoError(t, json.Unmarshal(raw, &b))
+	} else {
+		require.NoError(t, json.Unmarshal(raw, &e))
+	}
+	return code, b, e
 }
 
 // --- transition rules ---------------------------------------------------------

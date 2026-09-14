@@ -109,3 +109,96 @@ func mustTime(t *testing.T, s string) time.Time {
 	require.NoError(t, err)
 	return tm
 }
+
+// TestEvaluateAtProjectsOpenTakeoutWithoutWriting checks the read-only risk
+// projection directly at the store layer: while out of the cabinet the
+// projected total grows with asOf, crossing the limit flips the conclusion
+// without scrapping the batch, and in-cabinet batches get settled values.
+func TestEvaluateAtProjectsOpenTakeoutWithoutWriting(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "eval.db"))
+	require.NoError(t, err)
+	defer st.Close()
+
+	created := mustTime(t, "2026-09-13T08:00:00Z")
+	_, err = st.CreateBatch(ctx, "E-1", 10, created)
+	require.NoError(t, err)
+
+	// No events yet: asOf may equal creation time, projection is settled at 0.
+	b, p, err := st.EvaluateAt(ctx, "E-1", mustTime(t, "2026-09-13T08:00:00Z"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), p.AccumulatedSeconds)
+	assert.Equal(t, int64(10), p.RemainingSeconds)
+	assert.True(t, p.Usable)
+	assert.True(t, p.Settled)
+	assert.Equal(t, "in", b.State)
+
+	// Earlier than creation -> conflict.
+	_, _, err = st.EvaluateAt(ctx, "E-1", mustTime(t, "2026-09-13T07:59:59Z"))
+	require.Error(t, err)
+	var ce *store.ConflictError
+	require.ErrorAs(t, err, &ce)
+	assert.Equal(t, "time_not_monotonic", ce.Code)
+
+	// Out of the cabinet since 08:00:05 with 10s allowed.
+	_, err = st.ApplyEvent(ctx, "E-1", store.EventTakeout, mustTime(t, "2026-09-13T08:00:05Z"))
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		at     string
+		accum  int64
+		remain int64
+		usable bool
+	}{
+		{"2026-09-13T08:00:05Z", 0, 10, true}, // equal to the open takeout
+		{"2026-09-13T08:00:06Z", 1, 9, true},
+		{"2026-09-13T08:00:15Z", 10, 0, true},   // == limit still usable
+		{"2026-09-13T08:00:16Z", 11, -1, false}, // projected over limit
+	} {
+		b, p, err := st.EvaluateAt(ctx, "E-1", mustTime(t, tc.at))
+		require.NoError(t, err, "at=%s", tc.at)
+		assert.Equal(t, tc.accum, p.AccumulatedSeconds, "at=%s", tc.at)
+		assert.Equal(t, tc.remain, p.RemainingSeconds, "at=%s", tc.at)
+		assert.Equal(t, tc.usable, p.Usable, "at=%s", tc.at)
+		assert.False(t, p.Settled, "open takeout is never settled, at=%s", tc.at)
+		// The persisted aggregate never moves.
+		assert.Equal(t, int64(0), b.AccumulatedSeconds, "at=%s", tc.at)
+		assert.Equal(t, store.StatusUsable, b.Status, "at=%s", tc.at)
+		assert.Equal(t, store.StateOut, b.State, "at=%s", tc.at)
+	}
+
+	// Earlier than the last event -> conflict, still no writes.
+	_, _, err = st.EvaluateAt(ctx, "E-1", mustTime(t, "2026-09-13T08:00:04Z"))
+	require.ErrorAs(t, err, &ce)
+	assert.Equal(t, "time_not_monotonic", ce.Code)
+
+	events, err := st.ListEvents(ctx, "E-1")
+	require.NoError(t, err)
+	require.Len(t, events, 1, "evaluations never write events")
+
+	// A settled cycle (+10, exactly at the limit) then a reopened takeout: the
+	// projection extends the settled total.
+	_, err = st.ApplyEvent(ctx, "E-1", store.EventReturn, mustTime(t, "2026-09-13T08:00:15Z"))
+	require.NoError(t, err)
+	_, err = st.ApplyEvent(ctx, "E-1", store.EventTakeout, mustTime(t, "2026-09-13T08:00:20Z"))
+	require.NoError(t, err)
+	b, p, err = st.EvaluateAt(ctx, "E-1", mustTime(t, "2026-09-13T08:00:21Z"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(11), p.AccumulatedSeconds, "10 settled + 1 open")
+	assert.False(t, p.Usable)
+	assert.False(t, p.Settled)
+
+	// In-cabinet evaluation returns settled figures regardless of how far
+	// ahead asOf is.
+	_, err = st.ApplyEvent(ctx, "E-1", store.EventReturn, mustTime(t, "2026-09-13T08:00:21Z"))
+	require.NoError(t, err)
+	b, p, err = st.EvaluateAt(ctx, "E-1", mustTime(t, "2026-09-14T00:00:00Z"))
+	require.NoError(t, err)
+	assert.True(t, p.Settled)
+	assert.Equal(t, int64(11), p.AccumulatedSeconds)
+	assert.Equal(t, store.StatusScrapped, b.Status)
+	assert.False(t, p.Usable)
+
+	_, _, err = st.EvaluateAt(ctx, "GHOST", created)
+	assert.ErrorIs(t, err, store.ErrNotFound)
+}

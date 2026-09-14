@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -57,6 +58,16 @@ type batch struct {
 		RevokedAt    *string `json:"revokedAt"`
 		RevokeReason *string `json:"revokeReason"`
 	} `json:"lastEvent"`
+	Projection *projection `json:"projection"`
+}
+
+type projection struct {
+	AsOf               string `json:"asOf"`
+	AccumulatedSeconds int64  `json:"accumulatedSeconds"`
+	RemainingSeconds   int64  `json:"remainingSeconds"`
+	Usable             bool   `json:"usable"`
+	ProjectedOverLimit bool   `json:"projectedOverLimit"`
+	Settled            bool   `json:"settled"`
 }
 
 type event struct {
@@ -140,6 +151,13 @@ func getBatch(barcode string) (int, batch) {
 	var b batch
 	_ = json.Unmarshal(raw, &b)
 	return code, b
+}
+
+// getBatchAsOf GETs a batch with the optional asOf projection parameter.
+func getBatchAsOf(barcode, asOf string) (int, batch, apiErr) {
+	code, raw := do("GET",
+		apiBase+"/batches/"+barcode+"?asOf="+url.QueryEscape(asOf), nil)
+	return decodeBatch(code, raw)
 }
 
 func eventCount(barcode string) int {
@@ -390,6 +408,90 @@ func main() {
 	}
 	check("racing revoke stamped the audit row exactly once", code == 200 && len(evs) == 2 && revokedCount == 1,
 		fmt.Sprintf("events=%d revoked=%d", len(evs), revokedCount))
+
+	// 8. asOf advisory risk evaluation: projections grow with time and cross
+	// the limit without writing events or scrapping the batch; only the real
+	// return through the original endpoint settles the exposure.
+	b6 := fmt.Sprintf("VERIFY-F-%d", uniq)
+	code, b, _ = createBatch(b6, 10, "2026-01-01T00:00:00Z")
+	check("asOf: create batch (allowed=10s)", code == 201 && b.State == "in", fmt.Sprintf("status=%d", code))
+
+	// Legacy query: no projection key, unchanged response semantics.
+	var legacyKeys map[string]json.RawMessage
+	code, raw = do("GET", apiBase+"/batches/"+b6, nil)
+	_ = json.Unmarshal(raw, &legacyKeys)
+	_, hasProjectionKey := legacyKeys["projection"]
+	check("query without asOf keeps the legacy response (no projection key)",
+		code == 200 && !hasProjectionKey, fmt.Sprintf("status=%d", code))
+
+	code, b, _ = postEvent(b6, "takeout", "2026-01-01T00:00:05Z")
+	check("asOf: takeout before projections", code == 201 && b.State == "out", fmt.Sprintf("status=%d", code))
+
+	code, b, _ = getBatchAsOf(b6, "2026-01-01T00:00:06Z")
+	check("projection grows with asOf (1s projected, still usable)",
+		code == 200 && b.Projection != nil &&
+			b.Projection.AsOf == "2026-01-01T00:00:06Z" &&
+			b.Projection.AccumulatedSeconds == 1 && b.Projection.RemainingSeconds == 9 &&
+			b.Projection.Usable && !b.Projection.ProjectedOverLimit && !b.Projection.Settled &&
+			b.AccumulatedSeconds == 0 && b.RemainingSeconds == 10 &&
+			b.Status == "usable" && b.State == "out",
+		fmt.Sprintf("status=%d proj=%v", code, b.Projection))
+
+	code, b, _ = getBatchAsOf(b6, "2026-01-01T00:00:15Z")
+	check("projection exactly at the limit is still usable",
+		code == 200 && b.Projection.AccumulatedSeconds == 10 && b.Projection.RemainingSeconds == 0 &&
+			b.Projection.Usable && !b.Projection.ProjectedOverLimit,
+		fmt.Sprintf("status=%d proj=%v", code, b.Projection))
+
+	code, b, _ = getBatchAsOf(b6, "2026-01-01T00:00:16Z")
+	check("projection crosses the limit: 已预计超限 without scrapping the batch",
+		code == 200 && b.Projection.AccumulatedSeconds == 11 && b.Projection.RemainingSeconds == -1 &&
+			!b.Projection.Usable && b.Projection.ProjectedOverLimit && !b.Projection.Settled &&
+			b.Status == "usable" && b.State == "out" && b.AccumulatedSeconds == 0,
+		fmt.Sprintf("status=%d proj=%v status=%s", code, b.Projection, b.Status))
+
+	check("evaluations wrote no events", eventCount(b6) == 1, fmt.Sprintf("events=%d", eventCount(b6)))
+
+	code, _, e = getBatchAsOf(b6, "2026-01-01T00:00:04Z")
+	check("asOf earlier than the last event -> 409 time_not_monotonic",
+		code == 409 && e.Error.Code == "time_not_monotonic", fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+
+	code, raw = do("GET", apiBase+"/batches/"+b6+"?asOf=2026-01-01T00:00:16", nil)
+	_ = json.Unmarshal(raw, &e)
+	check("malformed asOf -> 400 invalid_time", code == 400 && e.Error.Code == "invalid_time",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+
+	_, b = getBatch(b6)
+	check("failed evaluations leave batch, totals and event log untouched",
+		b.State == "out" && b.Status == "usable" && b.AccumulatedSeconds == 0 && b.Projection == nil &&
+			eventCount(b6) == 1,
+		fmt.Sprintf("state=%s status=%s acc=%d events=%d", b.State, b.Status, b.AccumulatedSeconds, eventCount(b6)))
+
+	code, b, _ = postEvent(b6, "return", "2026-01-01T00:00:16Z")
+	check("only the original return endpoint settles exposure and scraps",
+		code == 201 && b.State == "in" && b.AccumulatedSeconds == 11 && b.Status == "scrapped" &&
+			b.Projection == nil,
+		fmt.Sprintf("status=%d acc=%d status=%s", code, b.AccumulatedSeconds, b.Status))
+	check("return timing used the open takeout exactly once", eventCount(b6) == 2,
+		fmt.Sprintf("events=%d", eventCount(b6)))
+
+	code, b, _ = getBatchAsOf(b6, "2026-01-01T01:00:00Z")
+	check("scrapped in-cabinet evaluation returns settled values far in the future",
+		code == 200 && b.Projection != nil && b.Projection.Settled &&
+			b.Projection.AccumulatedSeconds == 11 && b.Projection.RemainingSeconds == -1 &&
+			!b.Projection.Usable && b.Projection.ProjectedOverLimit,
+		fmt.Sprintf("status=%d proj=%v", code, b.Projection))
+
+	// A usable in-cabinet batch returns time-independent settled figures.
+	code, b, _ = getBatchAsOf(b2, "2026-01-01T00:05:00Z")
+	check("usable in-cabinet evaluation is settled and time-independent",
+		code == 200 && b.Projection != nil && b.Projection.Settled &&
+			b.Projection.AccumulatedSeconds == 10 && b.Projection.RemainingSeconds == 990 &&
+			b.Projection.Usable && !b.Projection.ProjectedOverLimit,
+		fmt.Sprintf("status=%d proj=%v", code, b.Projection))
+
+	code, _, _ = getBatchAsOf(fmt.Sprintf("NOPE-%d", uniq), "2026-01-01T00:00:00Z")
+	check("unknown barcode with asOf -> 404 not_found", code == 404, fmt.Sprintf("status=%d", code))
 
 	if failures > 0 {
 		fmt.Printf("\nverify: %d check(s) FAILED\n", failures)
