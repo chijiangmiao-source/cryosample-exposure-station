@@ -424,6 +424,11 @@ func main() {
 	check("query without asOf keeps the legacy response (no projection key)",
 		code == 200 && !hasProjectionKey, fmt.Sprintf("status=%d", code))
 
+	code, raw = do("GET", apiBase+"/batches/"+b6+"?asOf=", nil)
+	_ = json.Unmarshal(raw, &e)
+	check("present but empty asOf -> 400 invalid_time",
+		code == 400 && e.Error.Code == "invalid_time", fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+
 	code, b, _ = postEvent(b6, "takeout", "2026-01-01T00:00:05Z")
 	check("asOf: takeout before projections", code == 201 && b.State == "out", fmt.Sprintf("status=%d", code))
 

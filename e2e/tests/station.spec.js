@@ -332,6 +332,11 @@ test('柜内批次评估返回已结算数值，不带 asOf 的旧查询保持�
   expect(body.projection).toBeUndefined()
   expect(body.accumulatedSeconds).toBe(30)
 
+  // 参数存在但为空属于时刻格式非法 -> 400（只有完全不传才保持旧语义）
+  const empty = await request.get(`/api/batches/${barcode}?asOf=`)
+  expect(empty.status()).toBe(400)
+  expect((await empty.json()).error.code).toBe('invalid_time')
+
   // 非法 asOf 返回 400 invalid_time
   const bad = await request.get(`/api/batches/${barcode}?asOf=2026-01-02T00:00:00.5Z`)
   expect(bad.status()).toBe(400)

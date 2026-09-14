@@ -117,9 +117,10 @@ func (s *Server) createBatch(c *gin.Context) {
 
 func (s *Server) getBatch(c *gin.Context) {
 	// Optional asOf projects the exposure totals at the given time without
-	// persisting anything. Absent/empty: the response keeps its old semantics
-	// (settled values only); malformed: 400 invalid_time; earlier than the
-	// batch's last event: 409 time_not_monotonic.
+	// persisting anything. Absent: the response keeps its old semantics
+	// (settled values only). Present but malformed (including an empty
+	// value) -> 400 invalid_time; earlier than the batch's last event ->
+	// 409 time_not_monotonic.
 	rawAsOf, hasAsOf := c.GetQuery("asOf")
 	b, err := s.st.GetBatch(c.Request.Context(), c.Param("barcode"))
 	if errors.Is(err, store.ErrNotFound) {
@@ -131,7 +132,7 @@ func (s *Server) getBatch(c *gin.Context) {
 		return
 	}
 	var projection *store.Projection
-	if hasAsOf && rawAsOf != "" {
+	if hasAsOf {
 		asOf, err := parseEventTime(rawAsOf)
 		if err != nil {
 			writeErr(c, http.StatusBadRequest, "invalid_time", err.Error())

@@ -273,11 +273,18 @@ func TestGetBatchWithoutAsOfKeepsLegacySemantics(t *testing.T) {
 	assert.Equal(t, "out", b.State)
 	assert.Equal(t, "usable", b.Status)
 
-	// Explicitly empty asOf is treated the same as absent.
+	// An explicitly present but empty asOf is a malformed time, not "absent".
 	code, raw := getBatchRaw(t, srv, "Q-0", "asOf=")
-	require.Equal(t, http.StatusOK, code)
-	require.NoError(t, json.Unmarshal(raw, &b))
-	assert.Nil(t, b.Projection)
+	require.Equal(t, http.StatusBadRequest, code)
+	var pe errResp
+	require.NoError(t, json.Unmarshal(raw, &pe))
+	assert.Equal(t, "invalid_time", pe.Error.Code)
+
+	// Whitespace-only is malformed as well.
+	code, raw = getBatchRaw(t, srv, "Q-0", "asOf=%20%20")
+	require.Equal(t, http.StatusBadRequest, code)
+	require.NoError(t, json.Unmarshal(raw, &pe))
+	assert.Equal(t, "invalid_time", pe.Error.Code)
 }
 
 func TestProjectionGrowsWithAsOfAndCrossesTheLimit(t *testing.T) {
@@ -419,6 +426,8 @@ func TestProjectionInvalidTimeIsBadRequest(t *testing.T) {
 	srv := newServer(t)
 	createBatch(t, srv, "Q-5", 100, "2026-09-13T08:00:00Z")
 	for _, q := range []string{
+		"asOf=",                            // present but empty
+		"asOf=%20%20",                      // whitespace only
 		"asOf=2026-09-13T08:00:00",         // missing Z
 		"asOf=2026-09-13T08:00:00%2B08:00", // offset
 		"asOf=2026-09-13T08:00:00.000Z",    // fractional seconds
