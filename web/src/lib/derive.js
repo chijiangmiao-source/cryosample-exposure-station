@@ -32,3 +32,23 @@ export function statusLabel(batch) {
 export function eventTypeLabel(type) {
   return type === 'takeout' ? '取出' : type === 'return' ? '归还' : type
 }
+
+/** 该事件是否已被撤销。 */
+export function isEventRevoked(ev) {
+  return !!ev && ev.revokedAt != null
+}
+
+/** 流水中最后一条未撤销事件（可撤销目标）；没有则为 null。 */
+export function latestActiveEvent(events) {
+  if (!Array.isArray(events)) return null
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (!isEventRevoked(events[i])) return events[i]
+  }
+  return null
+}
+
+/** 只有当前最后一条未撤销事件允许撤销。 */
+export function canRevokeEvent(ev, events) {
+  const latest = latestActiveEvent(events)
+  return !!ev && !isEventRevoked(ev) && !!latest && latest.id === ev.id
+}

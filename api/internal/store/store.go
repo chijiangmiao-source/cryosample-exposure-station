@@ -7,6 +7,14 @@
 // accumulated total is <= the allowed seconds; exceeding the limit scraps
 // the batch permanently. Every event timestamp must be strictly later than
 // the batch's previous timestamp.
+//
+// A mistaken scan can be revoked: only the latest non-revoked event of the
+// batch may be revoked, and the revocation records its own whole-second
+// timestamp plus a non-empty reason. Revoking a takeout moves the batch back
+// into the cabinet; revoking a return subtracts that exposure again, restores
+// the out-of-cabinet state and re-evaluates usability. Revocation never
+// deletes rows: the event keeps revoked_at / revoke_reason for the audit
+// trail.
 package store
 
 import (
@@ -65,13 +73,16 @@ type Batch struct {
 	LastTakeoutAt      *time.Time // open takeout time, set while State == StateOut
 }
 
-// Event is one accepted takeout/return record.
+// Event is one accepted takeout/return record. A revoked event stays in the
+// log: RevokedAt/RevokeReason carry the audit trail of the undo.
 type Event struct {
 	ID           int64
 	Barcode      string
 	Type         string
 	At           time.Time
 	DeltaSeconds *int64 // exposure seconds added by a return; NULL for takeouts
+	RevokedAt    *time.Time
+	RevokeReason *string
 }
 
 // Store wraps the SQLite handle.
@@ -100,6 +111,29 @@ func Open(ctx context.Context, path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func migrate(ctx context.Context, db *sql.DB) error {
+	// Additive migration for databases created before revocation existed:
+	// SQLite has no "ADD COLUMN IF NOT EXISTS", so check pragma first.
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'events'`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		for _, col := range []string{"revoked_at", "revoke_reason"} {
+			var exists int
+			if err := db.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM pragma_table_info('events') WHERE name = ?`, col).Scan(&exists); err != nil {
+				return err
+			}
+			if exists == 0 {
+				if _, err := db.ExecContext(ctx,
+					`ALTER TABLE events ADD COLUMN `+col+` TEXT`); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS batches (
 			barcode             TEXT PRIMARY KEY,
@@ -118,7 +152,9 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			barcode       TEXT NOT NULL REFERENCES batches (barcode),
 			type          TEXT NOT NULL CHECK (type IN ('takeout', 'return')),
 			at            TEXT NOT NULL,
-			delta_seconds INTEGER
+			delta_seconds INTEGER,
+			revoked_at    TEXT,
+			revoke_reason TEXT
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_barcode ON events (barcode, id)`,
 	}
@@ -207,13 +243,15 @@ func scanBatch(row *sql.Row) (*Batch, error) {
 	return &b, nil
 }
 
-// ListEvents returns all accepted events of a batch in insertion order.
+// ListEvents returns the whole event log of a batch in insertion order,
+// including revoked events with their revocation audit fields.
 func (s *Store) ListEvents(ctx context.Context, barcode string) ([]Event, error) {
 	if _, err := s.GetBatch(ctx, barcode); err != nil {
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, barcode, type, at, delta_seconds FROM events WHERE barcode = ? ORDER BY id`, barcode)
+		`SELECT id, barcode, type, at, delta_seconds, revoked_at, revoke_reason
+		 FROM events WHERE barcode = ? ORDER BY id`, barcode)
 	if err != nil {
 		return nil, err
 	}
@@ -229,41 +267,36 @@ func (s *Store) ListEvents(ctx context.Context, barcode string) ([]Event, error)
 	return out, rows.Err()
 }
 
-// LastEvent returns the most recent event of a batch, or nil when none.
+// LastEvent returns the latest non-revoked event of a batch, or nil when the
+// batch has no active event.
 func (s *Store) LastEvent(ctx context.Context, barcode string) (*Event, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, barcode, type, at, delta_seconds FROM events WHERE barcode = ? ORDER BY id DESC LIMIT 1`, barcode)
-	var ev Event
-	var at string
-	var delta sql.NullInt64
-	err := row.Scan(&ev.ID, &ev.Barcode, &ev.Type, &at, &delta)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	t, err := parseTS(at)
-	if err != nil {
-		return nil, err
-	}
-	ev.At = t
-	if delta.Valid {
-		d := delta.Int64
-		ev.DeltaSeconds = &d
-	}
-	return &ev, nil
+		`SELECT id, barcode, type, at, delta_seconds, revoked_at, revoke_reason
+		 FROM events WHERE barcode = ? AND revoked_at IS NULL ORDER BY id DESC LIMIT 1`, barcode)
+	return scanEventRow(row)
 }
 
 type scanner interface {
 	Scan(dest ...any) error
 }
 
+func scanEventRow(row *sql.Row) (*Event, error) {
+	ev, err := scanEvent(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return ev, nil
+}
+
 func scanEvent(row scanner) (*Event, error) {
 	var ev Event
 	var at string
 	var delta sql.NullInt64
-	if err := row.Scan(&ev.ID, &ev.Barcode, &ev.Type, &at, &delta); err != nil {
+	var revokedAt, reason sql.NullString
+	if err := row.Scan(&ev.ID, &ev.Barcode, &ev.Type, &at, &delta, &revokedAt, &reason); err != nil {
 		return nil, err
 	}
 	t, err := parseTS(at)
@@ -274,6 +307,17 @@ func scanEvent(row scanner) (*Event, error) {
 	if delta.Valid {
 		d := delta.Int64
 		ev.DeltaSeconds = &d
+	}
+	if revokedAt.Valid {
+		t, err := parseTS(revokedAt.String)
+		if err != nil {
+			return nil, err
+		}
+		ev.RevokedAt = &t
+	}
+	if reason.Valid {
+		v := reason.String
+		ev.RevokeReason = &v
 	}
 	return &ev, nil
 }
@@ -360,4 +404,164 @@ func (s *Store) ApplyEvent(ctx context.Context, barcode, eventType string, at ti
 		return nil, err
 	}
 	return s.GetBatch(ctx, barcode)
+}
+
+const eventCols = `id, barcode, type, at, delta_seconds, revoked_at, revoke_reason`
+
+// RevokeEvent undoes the latest non-revoked event of a batch inside a single
+// transaction. The event row is never deleted: it is stamped with the
+// revocation time and a non-empty reason for the audit trail. Revoking a
+// takeout moves the batch back into the cabinet; revoking a return subtracts
+// that exposure, restores the out-of-cabinet state (with the takeout open
+// again) and re-evaluates usability. The batch aggregate is rewound to the
+// previous active event (or to creation time when there is none).
+//
+// It fails with a ConflictError when:
+//   - the event id is unknown for the batch (ErrNotFound otherwise),
+//   - the event was already revoked (event_already_revoked),
+//   - it is not the latest non-revoked event (event_not_latest),
+//   - the revocation time is not strictly later than the batch's last
+//     operation time (time_not_monotonic),
+//   - the batch changed concurrently (invalid_transition).
+//
+// Every failure rolls the whole transaction back: no revocation row change,
+// no aggregate or in/out change.
+func (s *Store) RevokeEvent(ctx context.Context, barcode string, eventID int64, at time.Time, reason string) (*Batch, *Event, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+
+	b, err := scanBatch(tx.QueryRowContext(ctx,
+		`SELECT `+batchCols+` FROM batches WHERE barcode = ?`, barcode))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ev, err := scanEventRow(tx.QueryRowContext(ctx,
+		`SELECT `+eventCols+` FROM events WHERE id = ? AND barcode = ?`, eventID, barcode))
+	if err != nil {
+		return nil, nil, err
+	}
+	if ev == nil {
+		return nil, nil, ErrNotFound
+	}
+	if ev.RevokedAt != nil {
+		return nil, nil, conflict("event_already_revoked",
+			"event %d was already revoked at %s", ev.ID, ts(*ev.RevokedAt))
+	}
+
+	latest, err := scanEventRow(tx.QueryRowContext(ctx,
+		`SELECT `+eventCols+` FROM events WHERE barcode = ? AND revoked_at IS NULL ORDER BY id DESC LIMIT 1`,
+		barcode))
+	if err != nil {
+		return nil, nil, err
+	}
+	if latest == nil {
+		return nil, nil, conflict("event_not_revocable", "batch has no active event to revoke")
+	}
+	if latest.ID != ev.ID {
+		return nil, nil, conflict("event_not_latest",
+			"only the latest non-revoked event (id %d) can be revoked", latest.ID)
+	}
+
+	if !at.After(b.LastAt) {
+		return nil, nil, conflict("time_not_monotonic",
+			"revocation time %s must be strictly later than the batch's previous time %s",
+			ts(at), ts(b.LastAt))
+	}
+
+	// Active event immediately before the one being revoked; the aggregate is
+	// rewound to it (or to the batch creation when nothing came before).
+	prev, err := scanEventRow(tx.QueryRowContext(ctx,
+		`SELECT `+eventCols+` FROM events WHERE barcode = ? AND revoked_at IS NULL ORDER BY id DESC LIMIT 1 OFFSET 1`,
+		barcode))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Stamp the audit fields. The revoked_at IS NULL predicate guarantees a
+	// duplicate/concurrent revocation of the same event can commit at most once.
+	res, err := tx.ExecContext(ctx,
+		`UPDATE events SET revoked_at = ?, revoke_reason = ?
+		 WHERE id = ? AND barcode = ? AND revoked_at IS NULL`,
+		ts(at), reason, ev.ID, barcode)
+	if err != nil {
+		return nil, nil, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return nil, nil, conflict("event_already_revoked", "event %d was revoked concurrently", ev.ID)
+	}
+
+	var (
+		newState    string
+		pinnedState string
+		newAccum    = b.AccumulatedSeconds
+		newLastAt   = b.CreatedAt
+		prevType    sql.NullString
+		prevAt      sql.NullString
+		prevTakeout sql.NullString
+	)
+	switch ev.Type {
+	case EventTakeout:
+		// Undo the takeout: the batch is back in the cabinet; exposure
+		// accumulated by earlier cycles is untouched.
+		newState, pinnedState = StateIn, StateOut
+	case EventReturn:
+		// Undo the return: give back that exposure and reopen the takeout.
+		if b.State != StateIn || ev.DeltaSeconds == nil {
+			return nil, nil, conflict("invalid_transition", "event %d is not reversible in the current state", ev.ID)
+		}
+		newState, pinnedState = StateOut, StateIn
+		newAccum = b.AccumulatedSeconds - *ev.DeltaSeconds
+		if newAccum < 0 {
+			return nil, nil, fmt.Errorf("invariant violated: accumulated exposure would become %d", newAccum)
+		}
+	default:
+		return nil, nil, fmt.Errorf("unknown event type %q", ev.Type)
+	}
+	newStatus := StatusUsable
+	if newAccum > b.AllowedSeconds {
+		newStatus = StatusScrapped
+	}
+	if prev != nil {
+		newLastAt = prev.At
+		prevType = sql.NullString{String: prev.Type, Valid: true}
+		prevAt = sql.NullString{String: ts(prev.At), Valid: true}
+		if prev.Type == EventTakeout {
+			prevTakeout = sql.NullString{String: ts(prev.At), Valid: true}
+		}
+	}
+
+	// The conditional UPDATE pins the state and last_at read above so a
+	// concurrent change makes the transaction affect zero rows.
+	res, err = tx.ExecContext(ctx, `UPDATE batches
+		SET state = ?, status = ?, accumulated_seconds = ?, last_at = ?,
+		    last_event_type = ?, last_event_at = ?, last_takeout_at = ?
+		WHERE barcode = ? AND state = ? AND last_at = ?`,
+		newState, newStatus, newAccum, ts(newLastAt),
+		prevType, prevAt, prevTakeout,
+		barcode, pinnedState, ts(b.LastAt))
+	if err != nil {
+		return nil, nil, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return nil, nil, conflict("invalid_transition", "batch state changed concurrently; retry")
+	}
+
+	revoked, err := scanEventRow(tx.QueryRowContext(ctx,
+		`SELECT `+eventCols+` FROM events WHERE id = ?`, ev.ID))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	out, err := s.GetBatch(ctx, barcode)
+	if err != nil {
+		return nil, nil, err
+	}
+	return out, revoked, nil
 }

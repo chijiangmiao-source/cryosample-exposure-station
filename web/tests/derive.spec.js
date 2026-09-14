@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
   canReturn,
+  canRevokeEvent,
   canTakeout,
   eventTypeLabel,
+  isEventRevoked,
   isUsable,
+  latestActiveEvent,
   remainingSeconds,
   stateLabel,
   statusLabel
@@ -58,5 +61,25 @@ describe('derive', () => {
   it('event type labels', () => {
     expect(eventTypeLabel('takeout')).toBe('取出')
     expect(eventTypeLabel('return')).toBe('归还')
+  })
+
+  it('revocation helpers find the latest active event', () => {
+    const takeout = { id: 1, type: 'takeout', at: '2026-09-13T08:00:05Z' }
+    const mistakenReturn = { id: 2, type: 'return', at: '2026-09-13T08:00:16Z', deltaSeconds: 11 }
+    expect(isEventRevoked(takeout)).toBe(false)
+    expect(latestActiveEvent([takeout, mistakenReturn]).id).toBe(2)
+    expect(canRevokeEvent(takeout, [takeout, mistakenReturn])).toBe(false)
+    expect(canRevokeEvent(mistakenReturn, [takeout, mistakenReturn])).toBe(true)
+
+    // After the return is revoked the takeout becomes revocable again.
+    const revokedReturn = { ...mistakenReturn, revokedAt: '2026-09-13T08:00:30Z', revokeReason: '误扫' }
+    expect(isEventRevoked(revokedReturn)).toBe(true)
+    expect(latestActiveEvent([takeout, revokedReturn]).id).toBe(1)
+    expect(canRevokeEvent(takeout, [takeout, revokedReturn])).toBe(true)
+    expect(canRevokeEvent(revokedReturn, [takeout, revokedReturn])).toBe(false)
+
+    expect(latestActiveEvent([])).toBeNull()
+    expect(latestActiveEvent(null)).toBeNull()
+    expect(canRevokeEvent(null, [takeout])).toBe(false)
   })
 })

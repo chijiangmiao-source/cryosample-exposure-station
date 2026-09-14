@@ -38,6 +38,17 @@ async function doReturn(page, at) {
   await page.getByTestId('return-btn').click()
 }
 
+// Only the latest non-revoked event renders a revoke button, so the button
+// selector is unique on the page.
+async function revokeLast(page, at, reason) {
+  await page.locator('button[data-test^="revoke-btn-"]').click()
+  await expect(page.getByTestId('revoke-form')).toBeVisible()
+  await page.getByTestId('revoke-at').fill(at)
+  await page.getByTestId('revoke-reason').fill(reason)
+  await page.getByTestId('revoke-submit').click()
+  await expect(page.getByTestId('revoke-form')).toBeHidden()
+}
+
 test('临界归还仍可用，刷新后状态保持一致', async ({ page }) => {
   const barcode = nextBarcode('BOUNDARY')
   await createBatch(page, barcode, 10)
@@ -129,4 +140,120 @@ test('事件时间不严格递增时被拒绝并提示', async ({ page }) => {
   await expect(page.getByTestId('error-banner')).toContainText('time_not_monotonic')
   await expect(page.getByTestId('state-badge')).toHaveText('柜内')
   await expect(page.getByTestId('accumulated')).toHaveText('0 秒')
+})
+
+test('误归还导致报废后可撤销：恢复柜外与原累计，再正确归还', async ({ page }) => {
+  const barcode = nextBarcode('UNDO-RETURN')
+  await createBatch(page, barcode, 10)
+
+  await takeout(page, '2026-01-01T00:00:05Z')
+  await doReturn(page, '2026-01-01T00:00:16Z') // 误归还：+11 > 10，报废
+  await expect(page.getByTestId('status-badge')).toHaveText('已报废')
+  await expect(page.getByTestId('accumulated')).toHaveText('11 秒')
+
+  // 撤销这条误归还
+  await revokeLast(page, '2026-01-01T00:00:30Z', '误扫归还，样本实际仍在柜外')
+
+  await expect(page.getByTestId('state-badge')).toHaveText('柜外')
+  await expect(page.getByTestId('status-badge')).toHaveText('可用')
+  await expect(page.getByTestId('accumulated')).toHaveText('0 秒')
+  await expect(page.getByTestId('remaining')).toHaveText('10 秒')
+  await expect(page.getByTestId('last-event')).toContainText('取出 @ 2026-01-01T00:00:05Z')
+  await expect(page.getByTestId('info-banner')).toContainText('已撤销事件')
+
+  // 审计结果：撤销时刻与原因显示在该记录旁
+  await expect(page.getByTestId('revoked-tag')).toContainText('2026-01-01T00:00:30Z')
+  await expect(page.getByTestId('revoked-reason')).toContainText('误扫归还，样本实际仍在柜外')
+
+  // 撤销后取出事件重新成为“最近事件”，归还按钮可用
+  await expect(page.getByTestId('return-btn')).toBeEnabled()
+  await expect(page.getByTestId('takeout-btn')).toBeDisabled()
+
+  // 继续按正确状态操作：正确归还 +10 恰好等于上限，仍可用
+  await doReturn(page, '2026-01-01T00:00:15Z')
+  await expect(page.getByTestId('state-badge')).toHaveText('柜内')
+  await expect(page.getByTestId('accumulated')).toHaveText('10 秒')
+  await expect(page.getByTestId('remaining')).toHaveText('0 秒')
+  await expect(page.getByTestId('status-badge')).toHaveText('可用')
+
+  // 刷新后一致
+  await page.reload()
+  await expect(page.getByTestId('state-badge')).toHaveText('柜内')
+  await expect(page.getByTestId('accumulated')).toHaveText('10 秒')
+  await expect(page.getByTestId('status-badge')).toHaveText('可用')
+  await expect(page.getByTestId('revoked-reason')).toContainText('误扫归还，样本实际仍在柜外')
+})
+
+test('误取出可撤销：批次回到柜内、无活动事件', async ({ page }) => {
+  const barcode = nextBarcode('UNDO-TAKEOUT')
+  await createBatch(page, barcode, 100)
+  await takeout(page, '2026-01-01T00:00:10Z')
+  await expect(page.getByTestId('state-badge')).toHaveText('柜外')
+
+  await revokeLast(page, '2026-01-01T00:00:20Z', '误扫取出')
+  await expect(page.getByTestId('state-badge')).toHaveText('柜内')
+  await expect(page.getByTestId('accumulated')).toHaveText('0 秒')
+  await expect(page.getByTestId('last-event')).toHaveText('尚无事件')
+  await expect(page.getByTestId('revoked-reason')).toContainText('误扫取出')
+  // 已无未撤销事件，页面不提供撤销按钮
+  await expect(page.locator('button[data-test^="revoke-btn-"]')).toHaveCount(0)
+})
+
+test('非最近事件不提供撤销入口，直接撤销被服务端 409 拒绝', async ({ page, request }) => {
+  const barcode = nextBarcode('UNDO-NONLATEST')
+  await createBatch(page, barcode, 100)
+  await takeout(page, '2026-01-01T00:00:05Z')
+  await doReturn(page, '2026-01-01T00:00:15Z')
+
+  // 页面上只有最近一条（归还）可撤销
+  await expect(page.locator('button[data-test^="revoke-btn-"]')).toHaveCount(1)
+
+  // 直接对非最近的取出事件发起撤销 -> 409 event_not_latest，状态不变
+  const evsRes = await request.get(`/api/batches/${barcode}/events`)
+  const { events } = await evsRes.json()
+  const takeoutId = events[0].id
+  const r = await request.post(`/api/batches/${barcode}/events/${takeoutId}/revoke`, {
+    data: { at: '2026-01-01T00:00:20Z', reason: '试图撤销旧取出' }
+  })
+  expect(r.status()).toBe(409)
+  expect((await r.json()).error.code).toBe('event_not_latest')
+
+  await page.reload()
+  await expect(page.getByTestId('accumulated')).toHaveText('10 秒')
+  await expect(page.locator('button[data-test^="revoke-btn-"]')).toHaveCount(1)
+})
+
+test('两个工位并发撤销同一最近事件，仅一次成功且不改变失败方累计', async ({ context, page }) => {
+  const barcode = nextBarcode('UNDO-RACE')
+  await createBatch(page, barcode, 100)
+  await takeout(page, '2026-01-01T00:00:05Z')
+  await doReturn(page, '2026-01-01T00:00:15Z')
+  await expect(page.getByTestId('accumulated')).toHaveText('10 秒')
+
+  const page2 = await context.newPage()
+  await scan(page2, barcode)
+  await expect(page2.getByTestId('state-badge')).toHaveText('柜内')
+
+  // 两个工位都打开撤销表单，填同一撤销时刻
+  await page.locator('button[data-test^="revoke-btn-"]').click()
+  await page.getByTestId('revoke-at').fill('2026-01-01T00:00:30Z')
+  await page.getByTestId('revoke-reason').fill('工位一撤销')
+  await page2.locator('button[data-test^="revoke-btn-"]').click()
+  await page2.getByTestId('revoke-at').fill('2026-01-01T00:00:30Z')
+  await page2.getByTestId('revoke-reason').fill('工位二撤销')
+
+  await page.getByTestId('revoke-submit').click()
+  await expect(page.getByTestId('revoke-form')).toBeHidden()
+  await expect(page.getByTestId('state-badge')).toHaveText('柜外')
+  await expect(page.getByTestId('accumulated')).toHaveText('0 秒')
+
+  await page2.getByTestId('revoke-submit').click()
+  // 失败方收到明确冲突，随后重新载入服务端状态
+  await expect(page2.getByTestId('error-banner')).toContainText('撤销被拒绝')
+  await expect(page2.getByTestId('revoke-form')).toBeHidden()
+  await expect(page2.getByTestId('state-badge')).toHaveText('柜外')
+  await expect(page2.getByTestId('accumulated')).toHaveText('0 秒')
+  await expect(page2.getByTestId('revoked-reason')).toContainText('工位一撤销')
+
+  await page2.close()
 })
