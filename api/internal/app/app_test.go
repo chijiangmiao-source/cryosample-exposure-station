@@ -47,6 +47,10 @@ type batchResp struct {
 		ProjectedOverLimit bool   `json:"projectedOverLimit"`
 		Settled            bool   `json:"settled"`
 	} `json:"projection"`
+	// MatchedBarcode reports the scanned code when it was a bound alias
+	// (omitted on a primary-barcode scan); Aliases lists bound backup codes.
+	MatchedBarcode string   `json:"matchedBarcode"`
+	Aliases        []string `json:"aliases"`
 }
 
 type errResp struct {

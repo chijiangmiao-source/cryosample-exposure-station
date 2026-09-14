@@ -5,6 +5,7 @@ import { isValidZ, nowZ } from './lib/time'
 import { canRevokeEvent, eventTypeLabel, isEventRevoked, projectionConclusion } from './lib/derive'
 import BatchCard from './components/BatchCard.vue'
 import LocationCard from './components/LocationCard.vue'
+import AliasCard from './components/AliasCard.vue'
 
 const barcode = ref('')
 const batch = ref(null)
@@ -12,6 +13,12 @@ const events = ref([])
 const error = ref('')
 const info = ref('')
 const busy = ref(false)
+
+// The code actually scanned when the page was reached through a bound backup
+// barcode (alias). Empty when the primary barcode was scanned. It is captured
+// once per lookup and deliberately kept across canonical-barcode reloads so
+// the "本次扫描使用了备用标签" hint lasts the whole session.
+const matchedBarcode = ref('')
 
 // Event timestamp submitted with 取出/归还; prefilled with "now", editable
 // so boundary conditions can be demonstrated and tested deterministically.
@@ -39,9 +46,96 @@ const locationBusy = ref(false)
 const locationInfo = ref('')
 const locationError = ref('')
 
+// Backup-barcode (alias) management messages, owned here for the same reason
+// as the location ones: a rejected bind must keep the loaded batch and the
+// typed alias (the draft lives in AliasCard), only explaining why.
+const aliasBusy = ref(false)
+const aliasInfo = ref('')
+const aliasError = ref('')
+
 function resetLocationMessages() {
   locationInfo.value = ''
   locationError.value = ''
+}
+
+function resetAliasMessages() {
+  aliasInfo.value = ''
+  aliasError.value = ''
+}
+
+function explainAliasError(e) {
+  if (e.status === 409 && e.code === 'alias_conflicts_barcode') {
+    return '该条码已是某批次的主条码，不能作为备用条码绑定；请更换标签后重试。当前批次与输入均未改变。'
+  }
+  if (e.status === 409 && e.code === 'duplicate_alias') {
+    return '该备用条码已经绑定在当前批次上，无需重复绑定；当前批次未改变。'
+  }
+  if (e.status === 409 && e.code === 'alias_bound_elsewhere') {
+    return '该备用条码已绑定到其他批次，全局唯一不能重复绑定；请更换标签后重试。当前批次与输入均未改变。'
+  }
+  if (e.status === 409 && e.code === 'alias_not_bound') {
+    return '该条码不存在或不属于当前批次的备用条码，未解除任何绑定；事件、暴露累计与格位占用均不变。'
+  }
+  if (e.status === 400 && e.code === 'alias_required') {
+    return '备用条码不能为空，请扫描或输入一个非空条码。'
+  }
+  if (e.status === 400 && e.code === 'alias_too_long') {
+    return '备用条码过长（最多 128 个字符）。'
+  }
+  if (e.status === 404) {
+    return '批次不存在，备用条码操作未执行。'
+  }
+  return `备用条码操作失败（${e.code || e.status}）：${e.message}`
+}
+
+// bindAlias binds a scanned backup code to the loaded canonical batch. On a
+// conflict the batch stays loaded and the typed draft stays in the card input;
+// only the authoritative batch (incl. its alias list) is reloaded.
+async function bindAlias(code) {
+  if (!batch.value) return
+  resetAliasMessages()
+  error.value = ''
+  aliasBusy.value = true
+  const canonical = batch.value.barcode
+  try {
+    const updated = await api.bindAlias(canonical, code)
+    batch.value = updated
+    aliasInfo.value = `已绑定备用条码「${code}」：扫描该条码或主条码「${canonical}」都进入同一份计时、撤销与库位记录。`
+  } catch (e) {
+    aliasError.value = explainAliasError(e)
+    try {
+      batch.value = await api.getBatch(canonical)
+    } catch {
+      /* keep the previously loaded batch on screen */
+    }
+  } finally {
+    aliasBusy.value = false
+  }
+}
+
+// unbindAlias removes a backup code of the loaded batch. Removing a code that
+// is missing or foreign is rejected without touching events, exposure or the
+// occupied slot.
+async function unbindAlias(code) {
+  if (!batch.value) return
+  resetAliasMessages()
+  error.value = ''
+  aliasBusy.value = true
+  const canonical = batch.value.barcode
+  try {
+    const updated = await api.unbindAlias(canonical, code)
+    batch.value = updated
+    aliasInfo.value = `已解除备用条码「${code}」；该条码此后无法再查询到本批次，主条码「${canonical}」流程不变。`
+  } catch (e) {
+    aliasError.value = explainAliasError(e)
+    try {
+      batch.value = await api.getBatch(canonical)
+    } catch {
+      /* keep the previously loaded batch on screen */
+    }
+  } finally {
+    aliasBusy.value = false
+  }
 }
 
 function explainLocationError(e) {
@@ -186,6 +280,7 @@ async function lookup() {
   showCreate.value = false
   revokeForm.value = null
   resetLocationMessages()
+  resetAliasMessages()
   const code = barcode.value.trim()
   if (!code) {
     error.value = '请输入或扫描批次条码'
@@ -193,7 +288,11 @@ async function lookup() {
   }
   busy.value = true
   try {
-    batch.value = await api.getBatch(code)
+    const res = await api.getBatch(code)
+    batch.value = res
+    // A bound alias resolves server-side: res.barcode is canonical and the
+    // optional matchedBarcode reports the code actually scanned.
+    matchedBarcode.value = res.matchedBarcode || ''
     localStorage.setItem('lastBarcode', code)
     await refreshEvents()
     eventTime.value = nowZ()
@@ -203,6 +302,7 @@ async function lookup() {
     events.value = []
     projection.value = null
     assessError.value = ''
+    matchedBarcode.value = ''
     if (e.status === 404) {
       showCreate.value = true
       createCreatedAt.value = nowZ()
@@ -219,6 +319,7 @@ async function submitCreate() {
   error.value = ''
   info.value = ''
   resetLocationMessages()
+  resetAliasMessages()
   const code = barcode.value.trim()
   if (!Number.isInteger(createAllowed.value) || createAllowed.value <= 0) {
     error.value = '允许暴露秒数必须是正整数'
@@ -239,6 +340,7 @@ async function submitCreate() {
     showCreate.value = false
     events.value = []
     revokeForm.value = null
+    matchedBarcode.value = ''
     info.value = '批次已创建：柜内，累计 0 秒'
     eventTime.value = nowZ()
     await autoAssess()
@@ -265,6 +367,7 @@ async function act(type) {
   error.value = ''
   info.value = ''
   resetLocationMessages()
+  resetAliasMessages()
   if (!batch.value) return
   if (!isValidZ(eventTime.value)) {
     error.value = '事件时间必须是带 Z 的 RFC3339 整秒，如 2026-09-13T08:00:00Z'
@@ -327,6 +430,7 @@ async function submitRevoke() {
   error.value = ''
   info.value = ''
   resetLocationMessages()
+  resetAliasMessages()
   if (!batch.value || !revokeForm.value) return
   const f = revokeForm.value
   if (!isValidZ(f.at)) {
@@ -430,6 +534,16 @@ onMounted(async () => {
       </div>
 
       <BatchCard :batch="batch" :busy="busy" @takeout="act('takeout')" @return="act('return')" />
+
+      <AliasCard
+        :batch="batch"
+        :busy="busy || aliasBusy"
+        :matched-barcode="matchedBarcode"
+        :result-text="aliasError || aliasInfo"
+        :result-kind="aliasError ? 'error' : (aliasInfo ? 'info' : '')"
+        @bind="bindAlias"
+        @unbind="unbindAlias"
+      />
 
       <LocationCard
         :batch="batch"

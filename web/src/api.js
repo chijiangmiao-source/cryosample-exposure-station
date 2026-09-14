@@ -52,5 +52,20 @@ export const api = {
   clearLocation: (barcode) =>
     request(`/batches/${encodeURIComponent(barcode)}/location`, {
       method: 'DELETE'
+    }),
+  // Backup barcodes (aliases): a bound alias resolves to the same canonical
+  // batch for every query, event, revocation and location operation. The
+  // batch responses always carry the canonical primary `barcode` plus, when an
+  // alias was scanned, the optional `matchedBarcode` that was hit.
+  listAliases: (barcode) =>
+    request(`/batches/${encodeURIComponent(barcode)}/aliases`),
+  bindAlias: (barcode, alias) =>
+    request(`/batches/${encodeURIComponent(barcode)}/aliases`, {
+      method: 'POST',
+      body: JSON.stringify({ alias })
+    }),
+  unbindAlias: (barcode, alias) =>
+    request(`/batches/${encodeURIComponent(barcode)}/aliases/${encodeURIComponent(alias)}`, {
+      method: 'DELETE'
     })
 }

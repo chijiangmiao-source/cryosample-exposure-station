@@ -22,6 +22,13 @@
 // the very same event transaction (a batch outside the cabinet occupies no
 // slot); a return leaves the batch unlocated until it is placed again, and
 // revoking a return likewise vacates its slot.
+//
+// Backup barcodes (aliases) provide an alternate label for the same batch:
+// scanning either the primary barcode or a bound alias resolves to the same
+// canonical batch, so timing, revocation and location records stay shared.
+// Aliases live in their own namespace ledger (batch_aliases): an alias is
+// globally unique, may never equal any primary barcode, and creating a batch
+// reuses that same shared namespace.
 package store
 
 import (
@@ -177,11 +184,30 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			barcode  TEXT PRIMARY KEY REFERENCES batches (barcode),
 			location TEXT NOT NULL UNIQUE
 		)`,
+		// batch_codes is the shared namespace of every scannable code: each
+		// batch owns exactly one "primary" row (code == barcode) and zero or
+		// more "alias" rows (backup barcodes bound to the same canonical
+		// batch). The PRIMARY KEY on code makes a code globally unique: an
+		// alias can neither duplicate another alias nor equal any primary
+		// barcode, and creating a batch reuses the same constraint.
+		`CREATE TABLE IF NOT EXISTS batch_codes (
+			code    TEXT PRIMARY KEY,
+			barcode TEXT NOT NULL REFERENCES batches (barcode),
+			kind    TEXT NOT NULL CHECK (kind IN ('primary', 'alias'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_batch_codes_barcode ON batch_codes (barcode)`,
 	}
 	for _, q := range stmts {
 		if _, err := db.ExecContext(ctx, q); err != nil {
 			return err
 		}
+	}
+	// Backfill primary codes for databases created before aliases existed
+	// (every existing batch barcode is its own primary code).
+	if _, err := db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO batch_codes (code, barcode, kind)
+		 SELECT barcode, barcode, 'primary' FROM batches`); err != nil {
+		return err
 	}
 	return nil
 }
@@ -194,16 +220,37 @@ func parseTS(s string) (time.Time, error) {
 }
 
 // CreateBatch inserts a new batch in the initial state (in cabinet, zero
-// accumulated exposure). It returns ErrDuplicate if the barcode exists.
+// accumulated exposure). It returns ErrDuplicate if the barcode is already
+// taken by another primary barcode or by a bound alias — every scannable code
+// shares one namespace. The batch row and its primary code row commit together.
 func (s *Store) CreateBatch(ctx context.Context, barcode string, allowedSeconds int64, createdAt time.Time) (*Batch, error) {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO batches
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `INSERT INTO batches
 		(barcode, allowed_seconds, state, status, accumulated_seconds, created_at, last_at)
 		VALUES (?, ?, ?, ?, 0, ?, ?)`,
-		barcode, allowedSeconds, StateIn, StatusUsable, ts(createdAt), ts(createdAt))
-	if err != nil {
+		barcode, allowedSeconds, StateIn, StatusUsable, ts(createdAt), ts(createdAt)); err != nil {
 		if isUniqueViolation(err) {
 			return nil, ErrDuplicate
 		}
+		return nil, err
+	}
+	// Register the primary code in the shared namespace. Its PRIMARY KEY also
+	// rejects a barcode that collides with an existing alias; the foreign key
+	// binds it to the batch just inserted.
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO batch_codes (code, barcode, kind) VALUES (?, ?, 'primary')`,
+		barcode, barcode); err != nil {
+		if isUniqueViolation(err) {
+			return nil, ErrDuplicate
+		}
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return s.GetBatch(ctx, barcode)

@@ -62,6 +62,10 @@ type batch struct {
 	// Location is the cabinet slot currently occupied by the batch; nil when
 	// unplaced. Decoded but ignored when verifying the legacy timing flow.
 	Location *string `json:"location"`
+	// MatchedBarcode reports the code actually scanned when a bound alias was
+	// hit (empty on a primary-barcode scan); Aliases lists bound backup codes.
+	MatchedBarcode string   `json:"matchedBarcode"`
+	Aliases        []string `json:"aliases"`
 }
 
 type projection struct {
@@ -140,6 +144,40 @@ func putLocation(barcode, location string) (int, batch, apiErr) {
 func deleteLocation(barcode string) (int, batch, apiErr) {
 	code, raw := do("DELETE", apiBase+"/batches/"+barcode+"/location", nil)
 	return decodeBatch(code, raw)
+}
+
+// bindAlias binds a backup barcode to an existing canonical batch.
+func bindAlias(barcode, alias string) (int, batch, apiErr) {
+	code, raw := do("POST", apiBase+"/batches/"+barcode+"/aliases",
+		map[string]string{"alias": alias})
+	return decodeBatch(code, raw)
+}
+
+// unbindAlias removes a backup barcode from a batch.
+func unbindAlias(barcode, alias string) (int, batch, apiErr) {
+	code, raw := do("DELETE",
+		fmt.Sprintf("%s/batches/%s/aliases/%s", apiBase, barcode, alias), nil)
+	return decodeBatch(code, raw)
+}
+
+// bindAliasRaw is a goroutine-safe variant returning (status, errorCode).
+func bindAliasRaw(barcode, alias string) (int, string) {
+	raw, _ := json.Marshal(map[string]string{"alias": alias})
+	req, _ := http.NewRequest("POST", apiBase+"/batches/"+barcode+"/aliases", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	res, err := client.Do(req)
+	if err != nil {
+		return -1, err.Error()
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK {
+		var e apiErr
+		if json.Unmarshal(body, &e) == nil {
+			return res.StatusCode, e.Error.Code
+		}
+	}
+	return res.StatusCode, ""
 }
 
 // putLocationRaw is a goroutine-safe variant returning (status, errorCode).
@@ -682,6 +720,179 @@ func main() {
 	check("old timing flow unaffected by the added field: return adds +10",
 		code == 201 && b.State == "in" && b.AccumulatedSeconds == 10 && b.Status == "usable",
 		fmt.Sprintf("status=%d acc=%d status=%s", code, b.AccumulatedSeconds, b.Status))
+
+	// 10. Backup barcodes (aliases): bind a spare/duplicate label to an
+	// existing batch, then scanning either code drives the same timing,
+	// revocation and location records; responses keep the primary barcode and
+	// optionally report the hit code. Conflicts are explicit and change
+	// nothing; unbinding a foreign/missing alias touches neither events,
+	// exposure nor occupancy; a concurrent bind of one alias wins once.
+	b11 := fmt.Sprintf("VERIFY-L-%d", uniq)
+	b12 := fmt.Sprintf("VERIFY-M-%d", uniq)
+	alias11 := fmt.Sprintf("VERIFY-L-%d-BACKUP", uniq)
+	code, b, _ = createBatch(b11, 100, "2026-01-04T00:00:00Z")
+	check("alias: create batch", code == 201 && b.State == "in", fmt.Sprintf("status=%d", code))
+	code, b, _ = createBatch(b12, 100, "2026-01-04T00:00:00Z")
+	check("alias: create a second batch", code == 201, fmt.Sprintf("status=%d", code))
+
+	code, b, e = bindAlias(b11, alias11)
+	check("bind a backup barcode to the batch",
+		code == 200 && b.Barcode == b11 && len(b.Aliases) == 1 && b.Aliases[0] == alias11 &&
+			b.MatchedBarcode == "",
+		fmt.Sprintf("status=%d barcode=%s aliases=%v matched=%q", code, b.Barcode, b.Aliases, b.MatchedBarcode))
+
+	// Scanning the alias resolves to the canonical batch and reports the hit.
+	_, b = getBatch(alias11)
+	check("scanning the alias resolves to the canonical batch with matchedBarcode",
+		b.Barcode == b11 && b.MatchedBarcode == alias11 && len(b.Aliases) == 1 && b.Aliases[0] == alias11,
+		fmt.Sprintf("barcode=%s matched=%s", b.Barcode, b.MatchedBarcode))
+	// Scanning the primary barcode carries no hit code (old semantics).
+	_, b = getBatch(b11)
+	check("scanning the primary barcode omits matchedBarcode",
+		b.Barcode == b11 && b.MatchedBarcode == "",
+		fmt.Sprintf("barcode=%s matched=%q", b.Barcode, b.MatchedBarcode))
+
+	// Place via primary, then relocate (move) through the alias.
+	aSlot1 := fmt.Sprintf("ASLOT-%d-1", uniq)
+	aSlot2 := fmt.Sprintf("ASLOT-%d-2", uniq)
+	aSlot3 := fmt.Sprintf("ASLOT-%d-3", uniq)
+	code, b, _ = putLocation(b11, aSlot1)
+	check("alias: place via the primary barcode", code == 200 && b.Location != nil && *b.Location == aSlot1,
+		fmt.Sprintf("status=%d loc=%v", code, b.Location))
+	code, b, _ = putLocation(alias11, aSlot2)
+	check("alias: relocate through the scanned backup label",
+		code == 200 && b.Barcode == b11 && b.MatchedBarcode == alias11 &&
+			b.Location != nil && *b.Location == aSlot2,
+		fmt.Sprintf("status=%d loc=%v matched=%s", code, b.Location, b.MatchedBarcode))
+
+	// Takeout through the alias auto-vacates the shared slot.
+	code, b, _ = postEvent(alias11, "takeout", "2026-01-04T00:00:05Z")
+	check("alias: takeout through the backup label releases the slot in one transaction",
+		code == 201 && b.Barcode == b11 && b.State == "out" && b.MatchedBarcode == alias11 && b.Location == nil,
+		fmt.Sprintf("status=%d state=%s loc=%v", code, b.State, b.Location))
+
+	// Return through the alias counts exposure once on the canonical batch and
+	// leaves it unplaced.
+	code, b, _ = postEvent(alias11, "return", "2026-01-04T00:00:15Z")
+	check("alias: return through the backup label counts +10 on the canonical batch",
+		code == 201 && b.State == "in" && b.AccumulatedSeconds == 10 && b.Location == nil,
+		fmt.Sprintf("status=%d acc=%d loc=%v", code, b.AccumulatedSeconds, b.Location))
+	check("alias: the event log is shared (two events via either code)",
+		eventCount(alias11) == 2 && eventCount(b11) == 2,
+		fmt.Sprintf("alias=%d primary=%d", eventCount(alias11), eventCount(b11)))
+
+	// Re-place through the alias; a refresh via the primary barcode still shows
+	// the alias-driven final state (refresh points at the same batch).
+	code, b, _ = putLocation(alias11, aSlot3)
+	check("alias: re-place through the backup label after return",
+		code == 200 && b.Location != nil && *b.Location == aSlot3, fmt.Sprintf("status=%d loc=%v", code, b.Location))
+	_, b = getBatch(b11)
+	check("alias: refresh via the primary barcode shows the shared state and slot",
+		b.State == "in" && b.AccumulatedSeconds == 10 && b.Location != nil && *b.Location == aSlot3 &&
+			len(b.Aliases) == 1,
+		fmt.Sprintf("acc=%d loc=%v aliases=%v", b.AccumulatedSeconds, b.Location, b.Aliases))
+
+	// Binding conflicts: primary-code collision (own or another batch), a
+	// duplicate alias on the same batch, the same alias on another batch, and
+	// creating a batch whose code is already an alias.
+	code, _, e = bindAlias(b11, b12)
+	check("bind a primary barcode as an alias -> 409 alias_conflicts_barcode",
+		code == 409 && e.Error.Code == "alias_conflicts_barcode",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+	code, _, e = bindAlias(b11, b11)
+	check("bind the batch's own primary barcode -> 409 alias_conflicts_barcode",
+		code == 409 && e.Error.Code == "alias_conflicts_barcode",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+	code, _, e = bindAlias(b11, alias11)
+	check("rebind the same alias to the same batch -> 409 duplicate_alias",
+		code == 409 && e.Error.Code == "duplicate_alias",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+	code, _, e = bindAlias(b12, alias11)
+	check("bind another batch's alias -> 409 alias_bound_elsewhere",
+		code == 409 && e.Error.Code == "alias_bound_elsewhere",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+	code, raw = do("POST", apiBase+"/batches", map[string]any{
+		"barcode": alias11, "allowedSeconds": 10, "createdAt": "2026-01-04T00:00:00Z",
+	})
+	_ = json.Unmarshal(raw, &e)
+	check("create a batch with a code already used by an alias -> 409 duplicate_barcode",
+		code == 409 && e.Error.Code == "duplicate_barcode",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+	code, raw = do("POST", apiBase+"/batches/"+b11+"/aliases", map[string]string{"alias": "   "})
+	_ = json.Unmarshal(raw, &e)
+	check("blank alias -> 400 alias_required", code == 400 && e.Error.Code == "alias_required",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+	// Conflicts leave the current batch and its relation intact.
+	_, b = getBatch(b11)
+	check("alias: rejected binds leave the batch, slot and relation intact",
+		b.AccumulatedSeconds == 10 && b.Location != nil && *b.Location == aSlot3 &&
+			len(b.Aliases) == 1 && b.Aliases[0] == alias11,
+		fmt.Sprintf("acc=%d loc=%v aliases=%v", b.AccumulatedSeconds, b.Location, b.Aliases))
+
+	// Unbinding a missing code or another batch's alias is rejected without
+	// touching events, exposure or occupancy.
+	code, _, e = unbindAlias(b11, "NO-SUCH-ALIAS-"+fmt.Sprint(uniq))
+	check("unbind a non-existent alias -> 409 alias_not_bound",
+		code == 409 && e.Error.Code == "alias_not_bound",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+	code, _, e = unbindAlias(b12, alias11)
+	check("one batch cannot unbind another batch's alias -> 409 alias_not_bound",
+		code == 409 && e.Error.Code == "alias_not_bound",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+	_, b = getBatch(alias11)
+	check("alias: rejected unbinds leave the relation, events, exposure and slot intact",
+		b.Barcode == b11 && b.MatchedBarcode == alias11 && b.AccumulatedSeconds == 10 &&
+			b.Location != nil && *b.Location == aSlot3 && eventCount(b11) == 2,
+		fmt.Sprintf("acc=%d loc=%v events=%d", b.AccumulatedSeconds, b.Location, eventCount(b11)))
+
+	// The owner unbinds it: the code can no longer be queried, but the primary
+	// batch, its totals and slot are unchanged, and its original flow works.
+	code, b, _ = unbindAlias(b11, alias11)
+	check("owner unbinds the backup barcode", code == 200 && len(b.Aliases) == 0 && b.Location != nil &&
+		*b.Location == aSlot3 && b.AccumulatedSeconds == 10,
+		fmt.Sprintf("status=%d aliases=%v loc=%v acc=%d", code, b.Aliases, b.Location, b.AccumulatedSeconds))
+	code, _ = getBatch(alias11)
+	check("after unbind the backup barcode can no longer be queried -> 404",
+		code == 404, fmt.Sprintf("status=%d", code))
+	code, _, e = unbindAlias(b11, alias11)
+	check("unbind again -> 409 alias_not_bound", code == 409 && e.Error.Code == "alias_not_bound",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+	code, b, _ = postEvent(b11, "takeout", "2026-01-04T00:00:20Z")
+	check("alias: primary-barcode timing flow unchanged after unbind",
+		code == 201 && b.State == "out" && b.AccumulatedSeconds == 10,
+		fmt.Sprintf("status=%d state=%s acc=%d", code, b.State, b.AccumulatedSeconds))
+
+	// The response keys stay additive: a primary scan carries aliases but no
+	// matchedBarcode.
+	var aliasKeys map[string]json.RawMessage
+	code, raw = do("GET", apiBase+"/batches/"+b12, nil)
+	_ = json.Unmarshal(raw, &aliasKeys)
+	_, hasMatchedKey := aliasKeys["matchedBarcode"]
+	_, hasAliasesKey := aliasKeys["aliases"]
+	check("primary scan omits matchedBarcode while aliases is an additive key",
+		code == 200 && !hasMatchedKey && hasAliasesKey, fmt.Sprintf("status=%d", code))
+
+	// Concurrency: several batches racing to bind the same backup code —
+	// exactly one wins, the rest get an explicit conflict.
+	raceAlias := fmt.Sprintf("VERIFY-RACEALIAS-%d", uniq)
+	acodes := make([]int, racers)
+	for i := 0; i < racers; i++ {
+		bc := fmt.Sprintf("VERIFY-N-%d-%d", uniq, i)
+		createBatch(bc, 1000, "2026-01-05T00:00:00Z")
+		wg.Add(1)
+		go func(i int, bc string) {
+			defer wg.Done()
+			acodes[i], _ = bindAliasRaw(bc, raceAlias)
+		}(i, bc)
+	}
+	wg.Wait()
+	check("racing alias binds: exactly one wins, the rest get 409",
+		countCode(acodes, 200) == 1 && countCode(acodes, 409) == racers-1,
+		fmt.Sprintf("codes=%v", acodes))
+	_, rb := getBatch(raceAlias)
+	check("the raced alias resolves to exactly one canonical batch and reports the hit",
+		rb.Barcode != "" && rb.MatchedBarcode == raceAlias && len(rb.Aliases) == 1 && rb.Aliases[0] == raceAlias,
+		fmt.Sprintf("barcode=%s matched=%s aliases=%v", rb.Barcode, rb.MatchedBarcode, rb.Aliases))
 
 	if failures > 0 {
 		fmt.Printf("\nverify: %d check(s) FAILED\n", failures)
